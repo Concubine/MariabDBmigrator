@@ -1,12 +1,13 @@
 """Main entry point for the MariaDB export tool."""
 import argparse
 import logging
+import sys
 from pathlib import Path
 from typing import List, Optional
 
 from .core.config import load_config
 from .core.exceptions import ConfigError, ExportError, ImportError
-from .domain.models import ExportOptions, ImportOptions
+from .domain.models import ExportOptions, ImportOptions, ImportMode
 from .infrastructure.mariadb import MariaDB
 from .infrastructure.storage import SQLStorage
 from .services.export import ExportService
@@ -85,10 +86,47 @@ def parse_args() -> argparse.Namespace:
         help="List of tables to import (default: all tables)"
     )
     import_parser.add_argument(
+        "--import-mode",
+        choices=[mode.value for mode in ImportMode],
+        default=ImportMode.SKIP.value,
+        help=(
+            "How to handle existing tables: "
+            "skip - Skip if table exists (default), "
+            "overwrite - Drop and recreate if exists, "
+            "merge - Keep structure but append data, "
+            "cancel - Stop if any table exists"
+        )
+    )
+    import_parser.add_argument(
         "--batch-size",
         type=int,
         default=1000,
         help="Number of rows to import in each batch"
+    )
+    import_parser.add_argument(
+        "--no-schema",
+        action="store_true",
+        help="Do not import table schemas"
+    )
+    import_parser.add_argument(
+        "--no-indexes",
+        action="store_true",
+        help="Do not import indexes"
+    )
+    import_parser.add_argument(
+        "--no-constraints",
+        action="store_true",
+        help="Do not import constraints"
+    )
+    import_parser.add_argument(
+        "--keep-foreign-keys",
+        action="store_true",
+        help="Do not disable foreign keys during import"
+    )
+    import_parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Continue importing other tables if an error occurs"
     )
     import_parser.add_argument(
         "--compress",
@@ -109,18 +147,34 @@ def parse_args() -> argparse.Namespace:
         help="Enable debug logging"
     )
     
-    return parser.parse_args()
+    # Debug logging for arguments
+    logger = logging.getLogger(__name__)
+    logger.debug(f"Command line arguments: {sys.argv}")
+    
+    # Handle module import case
+    if len(sys.argv) > 1 and sys.argv[1] in ["export", "import"]:
+        args = parser.parse_args()
+    else:
+        args = parser.parse_args(sys.argv[1:])
+    
+    logger.debug(f"Parsed arguments: {args}")
+    
+    return args
 
 def main() -> None:
     """Main entry point."""
     try:
+        # Set up logging first
+        setup_logging("DEBUG")
+        logger = logging.getLogger(__name__)
+        
         # Parse arguments
         args = parse_args()
         
-        # Set up logging
-        setup_logging("DEBUG" if args.debug else "INFO")
-        logger = logging.getLogger(__name__)
-        
+        if not args.mode:
+            logger.error("No operation mode specified")
+            return 1
+            
         # Load configuration
         config = load_config(args.config)
         
@@ -167,8 +221,14 @@ def main() -> None:
         elif args.mode == "import":
             # Create import options
             import_options = ImportOptions(
+                mode=ImportMode(args.import_mode),
                 batch_size=args.batch_size,
-                compression=args.compress
+                compression=args.compress,
+                include_schema=not args.no_schema,
+                include_indexes=not args.no_indexes,
+                include_constraints=not args.no_constraints,
+                disable_foreign_keys=not args.keep_foreign_keys,
+                continue_on_error=args.continue_on_error
             )
             
             # Create import service
@@ -190,12 +250,16 @@ def main() -> None:
             # Print summary
             logger.info("Import completed successfully:")
             for result in results:
-                logger.info(
-                    f"Table {result.table_name}: {result.total_rows} rows"
-                )
+                status_msg = f"Table {result.table_name}: {result.total_rows} rows"
+                if result.status == "skipped":
+                    logger.warning(f"{status_msg} (Skipped)")
+                elif result.status == "error":
+                    logger.error(f"{status_msg} (Error: {result.error_message})")
+                else:
+                    logger.info(f"{status_msg} (Imported)")
         
         else:
-            logger.error("No operation mode specified")
+            logger.error(f"Unknown operation mode: {args.mode}")
             return 1
     
     except ConfigError as e:

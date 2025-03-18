@@ -1,5 +1,6 @@
 """Domain models."""
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -11,6 +12,13 @@ class DatabaseConfig:
     user: str
     password: str
     database: str
+
+class ImportMode(Enum):
+    """Import mode for handling existing tables."""
+    SKIP = "skip"  # Skip if table exists
+    OVERWRITE = "overwrite"  # Drop and recreate if exists
+    MERGE = "merge"  # Keep structure but append data
+    CANCEL = "cancel"  # Stop if any table exists
 
 @dataclass
 class TableMetadata:
@@ -48,8 +56,14 @@ class ExportOptions:
 @dataclass
 class ImportOptions:
     """Import options."""
+    mode: ImportMode = ImportMode.SKIP  # How to handle existing tables
     batch_size: int = 1000
     compression: bool = False
+    include_schema: bool = True  # Whether to import schema files
+    include_indexes: bool = True  # Whether to import indexes
+    include_constraints: bool = True  # Whether to import constraints
+    disable_foreign_keys: bool = True  # Whether to disable foreign keys during import
+    continue_on_error: bool = False  # Whether to continue if an error occurs
 
 @dataclass
 class ExportResult:
@@ -63,4 +77,6 @@ class ExportResult:
 class ImportResult:
     """Import result."""
     table_name: str
-    total_rows: int 
+    total_rows: int
+    status: str  # 'imported', 'skipped', 'error'
+    error_message: Optional[str] = None 

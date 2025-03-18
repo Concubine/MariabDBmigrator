@@ -1,157 +1,187 @@
 """Import service implementation."""
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-import time
+import logging
 
 from ..core.exceptions import ImportError
-from ..domain.interfaces import DatabaseInterface, StorageInterface, ProgressInterface
-from ..domain.models import ImportOptions, ImportResult
+from ..domain.interfaces import DatabaseInterface, StorageInterface
+from ..domain.models import ImportOptions, ImportResult, ImportMode
+
+logger = logging.getLogger(__name__)
 
 class ImportService:
-    """Service for importing data into MariaDB."""
+    """Service for importing database data."""
     
     def __init__(
         self,
         database: DatabaseInterface,
-        storage: StorageInterface,
-        progress: ProgressInterface
+        storage: StorageInterface
     ):
         """Initialize the import service."""
         self.database = database
         self.storage = storage
-        self.progress = progress
     
-    def import_file(
-        self,
-        file_path: Path,
-        table_name: Optional[str] = None,
-        options: Optional[ImportOptions] = None
-    ) -> ImportResult:
-        """Import data from a SQL file into a table."""
+    def _check_table_exists(self, table_name: str) -> bool:
+        """Check if a table exists in the database."""
         try:
-            # Verify file extension
-            if not file_path.suffix.lower() == '.sql':
-                raise ImportError(f"Unsupported file format: {file_path.suffix}. Only SQL files are supported.")
+            self.database.get_table_metadata(table_name)
+            return True
+        except:
+            return False
+    
+    def _handle_existing_table(
+        self,
+        table_name: str,
+        options: ImportOptions
+    ) -> bool:
+        """Handle existing table based on import mode.
+        
+        Returns:
+            bool: True if import should proceed, False if it should be skipped.
+        """
+        exists = self._check_table_exists(table_name)
+        if not exists:
+            return True
             
-            # If table name not provided, use file name without extension
-            if not table_name:
-                table_name = file_path.stem
-            
-            # Load data from file
-            data = self.storage.load_data(
-                file_path=file_path,
-                format='sql',
-                compression=file_path.suffix.endswith('.gz')
+        if options.mode == ImportMode.CANCEL:
+            raise ImportError(
+                f"Table {table_name} already exists and mode is CANCEL"
             )
-            
-            if not data:
+        elif options.mode == ImportMode.SKIP:
+            logger.warning(f"Skipping existing table: {table_name}")
+            return False
+        elif options.mode == ImportMode.OVERWRITE:
+            logger.info(f"Dropping existing table: {table_name}")
+            self.database.execute_query(f"DROP TABLE {table_name}")
+            return True
+        elif options.mode == ImportMode.MERGE:
+            logger.info(f"Merging data into existing table: {table_name}")
+            return True
+        
+        return True
+    
+    def import_table(
+        self,
+        table_name: str,
+        input_dir: Path,
+        options: ImportOptions
+    ) -> ImportResult:
+        """Import a single table from SQL files."""
+        try:
+            # Check if we should proceed with import
+            should_import = self._handle_existing_table(table_name, options)
+            if not should_import:
                 return ImportResult(
                     table_name=table_name,
-                    rows_imported=0,
-                    start_time=time.time(),
-                    end_time=time.time()
+                    total_rows=0,
+                    status="skipped"
                 )
             
-            # Initialize progress
-            self.progress.initialize(len(data))
+            # Disable foreign keys if requested
+            if options.disable_foreign_keys:
+                self.database.execute_query("SET FOREIGN_KEY_CHECKS = 0")
             
-            # Start import
-            start_time = time.time()
-            rows_imported = 0
-            
-            # Process in batches
-            batch_size = options.batch_size if options else 1000
-            for i in range(0, len(data), batch_size):
-                batch = data[i:i + batch_size]
+            try:
+                # Import schema if requested
+                if options.include_schema:
+                    schema_file = input_dir / f"{table_name}.schema.sql"
+                    if schema_file.exists():
+                        schema = self.storage.load_schema(
+                            schema_file,
+                            options.compression
+                        )
+                        self.database.execute_query(schema)
                 
-                # Insert batch
-                self.database.insert_batch(table_name, batch)
+                # Import data
+                data_file = input_dir / f"{table_name}.sql"
+                if not data_file.exists():
+                    raise ImportError(f"Data file not found: {data_file}")
                 
-                # Update progress
-                rows_imported += len(batch)
-                self.progress.update(rows_imported)
+                total_rows = 0
+                batch = []
+                
+                # Load and execute data in batches
+                for row in self.storage.load_data(
+                    data_file,
+                    options.compression
+                ):
+                    batch.append(row)
+                    if len(batch) >= options.batch_size:
+                        self.database.execute_batch(batch)
+                        total_rows += len(batch)
+                        batch = []
+                
+                # Execute remaining rows
+                if batch:
+                    self.database.execute_batch(batch)
+                    total_rows += len(batch)
+                
+                return ImportResult(
+                    table_name=table_name,
+                    total_rows=total_rows,
+                    status="imported"
+                )
+                
+            finally:
+                # Re-enable foreign keys if they were disabled
+                if options.disable_foreign_keys:
+                    self.database.execute_query("SET FOREIGN_KEY_CHECKS = 1")
             
-            end_time = time.time()
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Failed to import table {table_name}: {error_msg}")
+            
+            if not options.continue_on_error:
+                raise ImportError(f"Failed to import table {table_name}: {error_msg}")
             
             return ImportResult(
                 table_name=table_name,
-                rows_imported=rows_imported,
-                start_time=start_time,
-                end_time=end_time
+                total_rows=0,
+                status="error",
+                error_message=error_msg
             )
-            
-        except Exception as e:
-            raise ImportError(f"Failed to import file {file_path}: {str(e)}")
     
-    def import_directory(
+    def import_tables(
         self,
-        directory: Path,
-        options: Optional[ImportOptions] = None
+        table_names: List[str],
+        input_dir: Path,
+        options: ImportOptions
     ) -> List[ImportResult]:
-        """Import all SQL files in a directory."""
+        """Import multiple tables from SQL files."""
         results = []
         
-        # Get all SQL files (excluding schema files)
-        data_files = [
-            f for f in directory.glob("*.sql")
-            if f.is_file() and not f.name.endswith('.schema.sql')
-        ]
+        # Check for CANCEL mode first
+        if options.mode == ImportMode.CANCEL:
+            for table_name in table_names:
+                if self._check_table_exists(table_name):
+                    raise ImportError(
+                        f"Table {table_name} exists and mode is CANCEL"
+                    )
         
-        for file_path in data_files:
+        # Import tables
+        for table_name in table_names:
             try:
-                # Determine table name from file name
-                table_name = file_path.stem
-                
-                # Import file
-                result = self.import_file(
-                    file_path=file_path,
-                    table_name=table_name,
-                    options=options
+                result = self.import_table(
+                    table_name,
+                    input_dir,
+                    options
                 )
                 results.append(result)
                 
+                if result.status == "imported":
+                    logger.info(
+                        f"Imported table {table_name}: {result.total_rows} rows"
+                    )
+                elif result.status == "skipped":
+                    logger.warning(f"Skipped table {table_name}")
+                else:
+                    logger.error(
+                        f"Failed to import table {table_name}: {result.error_message}"
+                    )
+                    
             except ImportError as e:
-                # Log error but continue with other files
-                print(f"Error importing file {file_path}: {str(e)}")
-                continue
+                if not options.continue_on_error:
+                    raise
+                logger.error(str(e))
         
-        return results
-    
-    def import_schema(
-        self,
-        schema_file: Path
-    ) -> None:
-        """Import table schema from a SQL file."""
-        try:
-            # Read schema SQL
-            with open(schema_file, 'r', encoding='utf-8') as f:
-                schema_sql = f.read()
-            
-            # Execute schema SQL
-            self.database.execute_query(schema_sql)
-            
-        except Exception as e:
-            raise ImportError(f"Failed to import schema from {schema_file}: {str(e)}")
-    
-    def import_with_schema(
-        self,
-        data_file: Path,
-        schema_file: Optional[Path] = None,
-        table_name: Optional[str] = None,
-        options: Optional[ImportOptions] = None
-    ) -> ImportResult:
-        """Import data with optional schema."""
-        try:
-            # Import schema if provided
-            if schema_file and schema_file.exists():
-                self.import_schema(schema_file)
-            
-            # Import data
-            return self.import_file(
-                file_path=data_file,
-                table_name=table_name,
-                options=options
-            )
-            
-        except Exception as e:
-            raise ImportError(f"Failed to import with schema: {str(e)}") 
+        return results 
