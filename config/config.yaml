@@ -1,0 +1,14 @@
+# Database configuration
+database:
+  host: localhost
+  port: 3306
+  user: root
+  password: rootpassword
+  database: testdb
+
+# Export configuration
+export:
+  output_dir: exports
+  batch_size: 1000
+  compression: false
+  format: csv 
