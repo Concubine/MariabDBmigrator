@@ -1,143 +1,191 @@
 """Main entry point for the MariaDB export tool."""
 import argparse
-import logging
-import os
 import sys
 from pathlib import Path
-from typing import List, Optional
-
-# Add the root directory to sys.path to ensure imports work in both
-# development and when bundled as an executable
-root_dir = Path(__file__).parent.parent
-if str(root_dir) not in sys.path:
-    sys.path.insert(0, str(root_dir))
+from typing import Optional
+import logging
 
 from src.core.config import load_config
-from src.core.exceptions import ConfigError, ExportError, ImportError
-from src.domain.models import ExportOptions, ImportOptions, ImportMode, DatabaseConfig
-from src.infrastructure.mariadb import MariaDB
-from src.infrastructure.storage import SQLStorage
+from src.core.logging import setup_logging, log_config
 from src.services.export import ExportService
 from src.services.import_ import ImportService
-
-logger = logging.getLogger(__name__)
-
-def setup_logging(level: str = "INFO", log_file: Optional[str] = None) -> None:
-    """Set up logging configuration."""
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        filename=log_file
-    )
+from src.domain.models import ImportMode
 
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="MariaDB Export Tool")
-    subparsers = parser.add_subparsers(dest="command", help="Command to execute")
+    parser = argparse.ArgumentParser(description="MariaDB database export/import tool")
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
     
     # Export command
-    export_parser = subparsers.add_parser("export", help="Export data from MariaDB")
-    export_parser.add_argument(
-        "--output-dir",
-        help="Output directory for exported files"
-    )
-    export_parser.add_argument(
-        "--tables",
-        nargs="+",
-        help="List of tables to export (default: all tables)"
-    )
-    export_parser.add_argument(
-        "--batch-size",
-        type=int,
-        help="Number of rows to export in each batch"
-    )
-    export_parser.add_argument(
-        "--where",
-        help="WHERE clause for filtering data"
-    )
-    export_parser.add_argument(
-        "--no-schema",
-        action="store_true",
-        help="Do not export table schemas"
-    )
-    export_parser.add_argument(
-        "--no-indexes",
-        action="store_true",
-        help="Do not export indexes"
-    )
-    export_parser.add_argument(
-        "--no-constraints",
-        action="store_true",
-        help="Do not export constraints"
-    )
-    export_parser.add_argument(
-        "--compress",
-        action="store_true",
-        help="Compress output files"
-    )
-    export_parser.add_argument(
-        "--parallel-workers",
-        type=int,
-        help="Number of parallel workers for export"
-    )
+    export_parser = subparsers.add_parser("export", help="Export database tables")
+    export_parser.add_argument("--tables", nargs="+", help="Specific tables to export")
+    export_parser.add_argument("--output-dir", help="Output directory for exports")
+    export_parser.add_argument("--batch-size", type=int, help="Number of rows per batch")
+    export_parser.add_argument("--compression", action="store_true", help="Enable compression")
+    export_parser.add_argument("--parallel-workers", type=int, help="Number of parallel workers")
+    export_parser.add_argument("--where", help="WHERE clause for filtering data")
+    export_parser.add_argument("--exclude-schema", action="store_true", help="Exclude schema from export")
+    export_parser.add_argument("--exclude-indexes", action="store_true", help="Exclude indexes from export")
+    export_parser.add_argument("--exclude-constraints", action="store_true", help="Exclude constraints from export")
+    export_parser.add_argument("--exclude-tables", nargs="+", help="Tables to exclude from export")
+    export_parser.add_argument("--exclude-data", nargs="+", help="Tables to export without data")
+    export_parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
+    
+    # Import command
+    import_parser = subparsers.add_parser("import", help="Import database tables")
+    import_parser.add_argument("files", nargs="+", help="SQL files to import")
+    import_parser.add_argument("--mode", choices=["skip", "overwrite", "merge", "cancel"], help="Import mode")
+    import_parser.add_argument("--batch-size", type=int, help="Number of rows per batch")
+    import_parser.add_argument("--compression", action="store_true", help="Enable compression")
+    import_parser.add_argument("--parallel-workers", type=int, help="Number of parallel workers")
+    import_parser.add_argument("--exclude-schema", action="store_true", help="Exclude schema from import")
+    import_parser.add_argument("--exclude-indexes", action="store_true", help="Exclude indexes from import")
+    import_parser.add_argument("--exclude-constraints", action="store_true", help="Exclude constraints from import")
+    import_parser.add_argument("--disable-foreign-keys", action="store_true", help="Disable foreign key checks")
+    import_parser.add_argument("--continue-on-error", action="store_true", help="Continue on error")
+    import_parser.add_argument("--import-schema", action="store_true", help="Import table schema")
+    import_parser.add_argument("--import-data", action="store_true", help="Import table data")
+    import_parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
+    
+    # Global options
+    parser.add_argument("--config", help="Path to configuration file")
     
     return parser.parse_args()
 
-def main() -> None:
+def main() -> int:
     """Main entry point."""
+    args = parse_args()
+    
+    # Load configuration
+    config_path = Path(args.config) if args.config else None
+    config = load_config(config_path)
+    
+    # Set up logging
+    if args.verbose:
+        config.logging.level = "DEBUG"
+    setup_logging(config.logging)
+    
+    # Log configuration
+    log_config({
+        'database': {
+            'host': config.database.host,
+            'port': config.database.port,
+            'user': config.database.user,
+            'password': '********',  # Hide password in logs
+            'database': config.database.database,
+            'use_pure': config.database.use_pure,
+            'auth_plugin': config.database.auth_plugin
+        },
+        'export': {
+            'output_dir': config.export.output_dir,
+            'batch_size': config.export.batch_size,
+            'compression': config.export.compression,
+            'parallel_workers': config.export.parallel_workers,
+            'tables': config.export.tables,
+            'where': config.export.where,
+            'exclude_schema': config.export.exclude_schema,
+            'exclude_indexes': config.export.exclude_indexes,
+            'exclude_constraints': config.export.exclude_constraints,
+            'exclude_tables': config.export.exclude_tables,
+            'exclude_data': config.export.exclude_data
+        },
+        'import': {
+            'batch_size': config.import_.batch_size,
+            'compression': config.import_.compression,
+            'parallel_workers': config.import_.parallel_workers,
+            'mode': config.import_.mode,
+            'exclude_schema': config.import_.exclude_schema,
+            'exclude_indexes': config.import_.exclude_indexes,
+            'exclude_constraints': config.import_.exclude_constraints,
+            'disable_foreign_keys': config.import_.disable_foreign_keys,
+            'continue_on_error': config.import_.continue_on_error,
+            'import_schema': config.import_.import_schema,
+            'import_data': config.import_.import_data
+        },
+        'logging': {
+            'level': config.logging.level,
+            'file': config.logging.file,
+            'format': config.logging.format
+        }
+    })
+    
     try:
-        # Parse command line arguments
-        args = parse_args()
-        if not args.command:
-            print("No command specified. Use --help for usage information.")
-            sys.exit(1)
-        
-        # Load configuration
-        config = load_config()
-        
-        # Set up logging
-        setup_logging(
-            level=config.logging.level,
-            log_file=config.logging.file if config.logging.file else None
-        )
-        
-        # Create database config
-        db_config = DatabaseConfig(
-            host=config.database.host,
-            port=config.database.port,
-            user=config.database.user,
-            password=config.database.password,
-            database=config.database.database,
-            use_pure=True
-        )
-        
         if args.command == "export":
+            # Override config with command line arguments
+            if args.tables:
+                config.export.tables = args.tables
+            if args.output_dir:
+                config.export.output_dir = args.output_dir
+            if args.batch_size:
+                config.export.batch_size = args.batch_size
+            if args.compression:
+                config.export.compression = True
+            if args.parallel_workers:
+                config.export.parallel_workers = args.parallel_workers
+            if args.where:
+                config.export.where = args.where
+            if args.exclude_schema:
+                config.export.exclude_schema = True
+            if args.exclude_indexes:
+                config.export.exclude_indexes = True
+            if args.exclude_constraints:
+                config.export.exclude_constraints = True
+            if args.exclude_tables:
+                config.export.exclude_tables = args.exclude_tables
+            if args.exclude_data:
+                config.export.exclude_data = args.exclude_data
+            
             # Create export service
-            service = ExportService(
-                config=db_config,
-                output_dir=args.output_dir or config.export.output_dir,
-                tables=args.tables,
-                batch_size=args.batch_size or config.export.batch_size,
-                where_clause=args.where,
-                exclude_schema=args.no_schema,
-                exclude_indexes=args.no_indexes,
-                exclude_constraints=args.no_constraints,
-                compress=args.compress or config.export.compression,
-                parallel_workers=args.parallel_workers or config.export.parallel_workers
-            )
+            service = ExportService(config.database, config.export)
+            service.export_data()
             
-            # Perform export
-            service.export()
+        elif args.command == "import":
+            # Override config with command line arguments
+            if args.mode:
+                config.import_.mode = args.mode
+            if args.batch_size:
+                config.import_.batch_size = args.batch_size
+            if args.compression:
+                config.import_.compression = True
+            if args.parallel_workers:
+                config.import_.parallel_workers = args.parallel_workers
+            if args.exclude_schema:
+                config.import_.exclude_schema = True
+            if args.exclude_indexes:
+                config.import_.exclude_indexes = True
+            if args.exclude_constraints:
+                config.import_.exclude_constraints = True
+            if args.disable_foreign_keys:
+                config.import_.disable_foreign_keys = True
+            if args.continue_on_error:
+                config.import_.continue_on_error = True
+            if args.import_schema:
+                config.import_.import_schema = True
+            if args.import_data:
+                config.import_.import_data = True
             
-    except ConfigError as e:
-        logger.error(f"Configuration error: {str(e)}")
-        sys.exit(1)
-    except ExportError as e:
-        logger.error(f"Export error: {str(e)}")
-        sys.exit(1)
+            # Create import service
+            service = ImportService(config.database, args.files, **{
+                'mode': config.import_.mode,
+                'batch_size': config.import_.batch_size,
+                'exclude_schema': config.import_.exclude_schema,
+                'exclude_indexes': config.import_.exclude_indexes,
+                'exclude_constraints': config.import_.exclude_constraints,
+                'disable_foreign_keys': config.import_.disable_foreign_keys,
+                'continue_on_error': config.import_.continue_on_error,
+                'parallel_workers': config.import_.parallel_workers
+            })
+            service.import_data()
+            
+        else:
+            print("Error: No command specified")
+            return 1
+            
+        return 0
+        
     except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
-        sys.exit(1)
+        print(f"Error: {str(e)}")
+        return 1
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

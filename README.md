@@ -1,112 +1,77 @@
-# MariaDB Export Tool
+# MariaDB Export/Import Tool
 
-A command-line tool for exporting data from MariaDB databases to various file formats.
+A high-performance parallel tool for exporting and importing MariaDB databases.
+
+## Status
+- Export: ✅ Working with parallel processing
+- Import: ⚠️ Needs validation
 
 ## Features
+- Parallel data processing for improved performance
+- Configurable batch size and number of workers
+- Support for selective table export/import
+- Compression support
+- Configurable export/import modes
+- Verbose logging options
 
-- Export entire databases or specific tables
-- Support for custom SQL queries
-- Multiple export formats (CSV, JSON, SQL)
-- Optional compression
-- Progress tracking with ETA
-- Configurable batch size
-- Data filtering with WHERE clauses
+## Requirements
+- Python 3.12+
+- MariaDB/MySQL Server
+- Required Python packages (see requirements.txt)
 
 ## Installation
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/mariadbexport.git
-cd mariadbexport
+git clone [repository-url]
 ```
 
-2. Create a virtual environment and activate it:
+2. Install dependencies:
 ```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
-
-3. Install dependencies:
-```bash
-pip install -r requirements/prod.txt
-```
-
-## Configuration
-
-1. Copy the example configuration file:
-```bash
-cp config/config.yaml.example config/config.yaml
-```
-
-2. Edit `config/config.yaml` with your database settings:
-```yaml
-database:
-  host: localhost
-  port: 3306
-  user: your_username
-  password: your_password
-  database: your_database
+pip install -r requirements.txt
 ```
 
 ## Usage
 
-### Export all tables
-
+### Export
 ```bash
-python main.py --format csv --output-dir exports
+mariadbexport.exe export [options]
+
+Options:
+  --verbose             Enable verbose logging
+  --batch-size         Number of rows to process in each batch (default: 1000)
+  --parallel-workers   Number of parallel workers (default: 16)
+  --compress           Enable compression for output files
+  --tables            Specific tables to export (comma-separated)
+  --exclude-tables    Tables to exclude from export (comma-separated)
+  --where             WHERE clause for filtering data
 ```
 
-### Export a specific table
-
+### Import
 ```bash
-python main.py --table users --format json --compression
+mariadbexport.exe import [options]
+
+Options:
+  --verbose             Enable verbose logging
+  --batch-size         Number of rows to process in each batch (default: 1000)
+  --parallel-workers   Number of parallel workers (default: 16)
+  --mode              Import mode (skip/replace/truncate)
+  --disable-fk        Disable foreign key checks during import
+  --continue-on-error Continue importing on error
 ```
 
-### Export with custom query
+## Configuration
+The tool uses environment variables for database connection:
+- `DB_HOST` - Database host (default: localhost)
+- `DB_PORT` - Database port (default: 3306)
+- `DB_USER` - Database username
+- `DB_PASSWORD` - Database password
+- `DB_NAME` - Database name
 
+## Building from Source
 ```bash
-python main.py --query "SELECT * FROM users WHERE age > 18" --format csv
-```
-
-### Export with WHERE clause
-
-```bash
-python main.py --table orders --where "status = 'completed'" --format json
-```
-
-## Command Line Arguments
-
-- `--config`: Path to configuration file (default: config/config.yaml)
-- `--table`: Specific table to export
-- `--query`: Custom SQL query to export
-- `--format`: Export format (csv, json, sql) (default: csv)
-- `--output-dir`: Output directory for exported files (default: exports)
-- `--compression`: Enable compression for exported files
-- `--where`: WHERE clause for filtering data
-
-## Development
-
-### Setup Development Environment
-
-```bash
-pip install -r requirements/dev.txt
-```
-
-### Running Tests
-
-```bash
-pytest
-```
-
-### Code Style
-
-```bash
-black .
-isort .
-flake8
-mypy .
+python -m PyInstaller mariadbexport.spec --clean
 ```
 
 ## License
-
-This project is licensed under the MIT License - see the LICENSE file for details. 
+[License information] 

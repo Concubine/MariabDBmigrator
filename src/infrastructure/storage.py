@@ -160,4 +160,55 @@ class SQLStorage(StorageInterface):
             return schema
             
         except Exception as e:
-            raise StorageError(f"Failed to load schema from {file_path}: {str(e)}") 
+            raise StorageError(f"Failed to load schema from {file_path}: {str(e)}")
+    
+    def write_schema(
+        self,
+        file_path: Path,
+        metadata: TableMetadata
+    ) -> None:
+        """Write table schema to a SQL file.
+        
+        This is an alias for save_schema that accepts TableMetadata.
+        
+        Args:
+            file_path: Path to save schema to
+            metadata: Table metadata
+        """
+        # Generate CREATE TABLE statement
+        schema = f"CREATE TABLE {metadata.name} (\n"
+        
+        # Add columns
+        column_defs = []
+        for column in metadata.columns:
+            column_defs.append(f"  {column}")
+        
+        # Add primary key if present
+        if metadata.primary_key:
+            pk_cols = ', '.join(metadata.primary_key)
+            column_defs.append(f"  PRIMARY KEY ({pk_cols})")
+            
+        # Add foreign keys
+        for fk in metadata.foreign_keys:
+            fk_def = f"  FOREIGN KEY ({fk['column']}) REFERENCES {fk['ref_table']}({fk['ref_column']})"
+            if 'on_delete' in fk:
+                fk_def += f" ON DELETE {fk['on_delete']}"
+            if 'on_update' in fk:
+                fk_def += f" ON UPDATE {fk['on_update']}"
+            column_defs.append(fk_def)
+            
+        # Add indexes
+        for idx in metadata.indexes:
+            idx_def = f"  INDEX {idx['name']} ({', '.join(idx['columns'])})"
+            column_defs.append(idx_def)
+            
+        # Add constraints
+        for constraint in metadata.constraints:
+            constraint_def = f"  CONSTRAINT {constraint['name']} {constraint['definition']}"
+            column_defs.append(constraint_def)
+            
+        schema += ',\n'.join(column_defs)
+        schema += "\n);"
+        
+        # Save schema
+        self.save_schema(schema, file_path, compression=False) 

@@ -5,11 +5,12 @@ from typing import List, Dict, Any, Optional, Iterator
 import logging
 from datetime import datetime, date
 
-from ..core.exceptions import DatabaseError
+from src.core.exceptions import DatabaseError
+from src.core.logging import get_logger
 from ..domain.interfaces import DatabaseInterface
 from ..domain.models import TableMetadata, ColumnMetadata, DatabaseConfig
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 class MariaDB(DatabaseInterface):
     """Implementation of MariaDB database operations."""
@@ -289,4 +290,88 @@ class MariaDB(DatabaseInterface):
     
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit."""
-        self.disconnect() 
+        self.disconnect()
+
+    def table_exists(self, table_name: str) -> bool:
+        """Check if a table exists in the database.
+        
+        Args:
+            table_name: Name of the table to check
+            
+        Returns:
+            True if the table exists, False otherwise
+        """
+        try:
+            self._ensure_connected()
+            self._cursor.execute("""
+                SELECT COUNT(*) as count
+                FROM information_schema.tables
+                WHERE table_schema = %s
+                AND table_name = %s
+            """, (self.config['database'], table_name))
+            return self._cursor.fetchone()['count'] > 0
+        except Error as e:
+            raise DatabaseError(f"Failed to check if table {table_name} exists: {str(e)}")
+
+    def drop_table(self, table_name: str) -> None:
+        """Drop a table from the database.
+        
+        Args:
+            table_name: Name of the table to drop
+        """
+        try:
+            self._ensure_connected()
+            self._cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+            self._connection.commit()
+        except Error as e:
+            raise DatabaseError(f"Failed to drop table {table_name}: {str(e)}")
+
+    def create_table(self, schema: str) -> None:
+        """Create a table using the provided schema.
+        
+        Args:
+            schema: CREATE TABLE statement
+        """
+        try:
+            self._ensure_connected()
+            self._cursor.execute(schema)
+            self._connection.commit()
+        except Error as e:
+            raise DatabaseError(f"Failed to create table: {str(e)}")
+
+    def import_table_data(self, table_name: str, data_file: str, batch_size: int = 1000) -> int:
+        """Import data into a table from a SQL file.
+        
+        Args:
+            table_name: Name of the table to import into
+            data_file: Path to the SQL file containing INSERT statements
+            batch_size: Number of rows to import in each batch
+            
+        Returns:
+            Number of rows imported
+        """
+        try:
+            self._ensure_connected()
+            total_rows = 0
+            
+            with open(data_file, 'r') as f:
+                batch = []
+                for line in f:
+                    line = line.strip()
+                    if line and line.startswith('INSERT INTO'):
+                        batch.append(line)
+                        if len(batch) >= batch_size:
+                            self.execute_batch(batch)
+                            total_rows += len(batch)
+                            batch = []
+                
+                if batch:
+                    self.execute_batch(batch)
+                    total_rows += len(batch)
+            
+            return total_rows
+            
+        except Error as e:
+            raise DatabaseError(f"Failed to import data into table {table_name}: {str(e)}")
+        except IOError as e:
+            raise DatabaseError(f"Failed to read data file {data_file}: {str(e)}") 

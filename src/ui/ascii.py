@@ -1,8 +1,10 @@
 """ASCII interface implementation."""
 import sys
+import time
 from typing import Optional, List
 from pathlib import Path
 from datetime import datetime
+from dataclasses import dataclass
 
 from ..domain.models import ExportResult, ExportFormat
 from ..ui.progress import ProgressStats

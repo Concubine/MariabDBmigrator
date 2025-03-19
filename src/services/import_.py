@@ -3,132 +3,178 @@ import logging
 from pathlib import Path
 from typing import List, Optional
 
+from src.core.logging import get_logger
 from src.core.exceptions import ImportError
-from src.domain.models import ImportOptions, ImportResult, ImportMode
+from src.core.config import ImportConfig, DatabaseConfig
+from src.domain.models import ImportResult, ImportMode
 from src.infrastructure.mariadb import MariaDB
 from src.infrastructure.storage import SQLStorage
 from src.infrastructure.parallel import ParallelWorker, WorkerConfig
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 class ImportService:
-    """Service for importing data into MariaDB."""
+    """Service for importing database tables."""
     
-    def __init__(self, database: MariaDB, storage: SQLStorage):
+    def __init__(self, database: DatabaseConfig, files: List[str], config: ImportConfig):
         """Initialize the import service.
         
         Args:
-            database: Database connection
-            storage: Storage handler
+            database: Database configuration
+            files: List of SQL files to import
+            config: Import configuration
         """
         self.database = database
-        self.storage = storage
-    
-    def import_tables(
-        self,
-        tables: List[str],
-        input_dir: Path,
-        options: ImportOptions
-    ) -> List[ImportResult]:
-        """Import multiple tables in parallel.
+        self.files = files
+        self.config = config
+        self.db = MariaDB(database)
+        self.storage = SQLStorage()
         
-        Args:
-            tables: List of table names to import
-            input_dir: Input directory containing SQL files
-            options: Import options
-            
+    def import_data(self) -> List[ImportResult]:
+        """Import tables into the database.
+        
         Returns:
             List of import results
             
         Raises:
             ImportError: If import fails
         """
-        if not input_dir.exists():
-            raise ImportError(f"Input directory not found: {input_dir}")
-        
-        # Create worker config
-        worker_config = WorkerConfig(
-            max_workers=options.parallel_workers,
-            use_processes=False,  # Use threads for I/O-bound operations
-            chunk_size=1  # Process one table at a time
-        )
-        
-        # Import tables in parallel
-        with ParallelWorker(worker_config) as worker:
-            results = worker.map(
-                lambda table: self._import_table(table, input_dir, options),
-                tables
-            )
-        
-        return results
-    
-    def _import_table(
-        self,
-        table: str,
-        input_dir: Path,
-        options: ImportOptions
-    ) -> ImportResult:
-        """Import a single table.
+        try:
+            # Connect to database
+            self.db.connect()
+            
+            # Import each file
+            results = []
+            for file_path in self.files:
+                result = self._import_file(Path(file_path))
+                results.append(result)
+                
+            return results
+            
+        except Exception as e:
+            raise ImportError(f"Import failed: {str(e)}")
+            
+        finally:
+            self.db.disconnect()
+            
+    def _import_file(self, file_path: Path) -> ImportResult:
+        """Import a single SQL file.
         
         Args:
-            table: Table name to import
-            input_dir: Input directory
-            options: Import options
+            file_path: Path to SQL file
             
         Returns:
             Import result
-            
-        Raises:
-            ImportError: If import fails
         """
-        try:
-            logger.info(f"Importing table: {table}")
-            
-            # Check if table exists
-            if self.database.table_exists(table):
-                if options.mode == ImportMode.CANCEL:
-                    return ImportResult(
-                        table_name=table,
-                        status="skipped",
-                        error_message="Table already exists"
-                    )
-                elif options.mode == ImportMode.OVERWRITE:
-                    self.database.drop_table(table)
-                elif options.mode == ImportMode.SKIP:
-                    return ImportResult(
-                        table_name=table,
-                        status="skipped",
-                        error_message="Table already exists"
-                    )
-            
-            # Import schema if requested
-            schema_file = input_dir / f"{table}.schema.sql"
-            if options.include_schema and schema_file.exists():
-                schema = self.storage.load_schema(schema_file)
-                self.database.create_table(schema)
-            
-            # Import data
-            data_file = input_dir / f"{table}.sql"
-            if not data_file.exists():
-                raise ImportError(f"Data file not found: {data_file}")
-            
-            total_rows = self.database.import_table_data(
-                table,
-                data_file,
-                options.batch_size
+        if not file_path.exists():
+            return ImportResult(
+                table_name=file_path.stem,
+                status="error",
+                error_message=f"File not found: {file_path}"
             )
             
+        try:
+            # Get table name from file name
+            table_name = file_path.stem
+            
+            # Check if table exists
+            if self.db.table_exists(table_name):
+                if self.config.mode == ImportMode.SKIP.value:
+                    logger.info(f"Skipping table {table_name} - already exists")
+                    return ImportResult(table_name=table_name, status="skipped")
+                    
+                elif self.config.mode == ImportMode.OVERWRITE.value:
+                    logger.info(f"Dropping existing table {table_name}")
+                    self.db.drop_table(table_name)
+                    
+                elif self.config.mode == ImportMode.CANCEL.value:
+                    logger.info(f"Skipping table {table_name} - already exists")
+                    return ImportResult(
+                        table_name=table_name,
+                        status="error",
+                        error_message="Table already exists"
+                    )
+                    
+            # Create table if schema import is enabled
+            if self.config.import_schema:
+                logger.info(f"Creating table {table_name}")
+                schema = self.storage.read_schema(file_path)
+                self.db.create_table(table_name, schema)
+                
+            # Import data if enabled
+            total_rows = 0
+            if self.config.import_data:
+                # Configure parallel worker
+                worker_config = WorkerConfig(
+                    max_workers=self.config.parallel_workers,
+                    batch_size=self.config.batch_size
+                )
+                
+                # Import data in parallel
+                logger.info(f"Importing data into table {table_name}")
+                worker = ParallelWorker(worker_config)
+                total_rows = worker.process_table(
+                    table=table_name,
+                    database=self.database,
+                    input_file=file_path,
+                    disable_foreign_keys=self.config.disable_foreign_keys
+                )
+                
+                logger.info(f"Successfully imported {total_rows} rows into table {table_name}")
+                
             return ImportResult(
-                table_name=table,
+                table_name=table_name,
                 status="success",
                 total_rows=total_rows
             )
             
         except Exception as e:
-            if options.continue_on_error:
+            error_msg = str(e)
+            if self.config.continue_on_error:
+                logger.warning(f"Error importing {file_path.name}: {error_msg}")
                 return ImportResult(
-                    table_name=table,
+                    table_name=file_path.stem,
                     status="error",
-                    error_message=str(e)
+                    error_message=error_msg
                 )
-            raise ImportError(f"Failed to import table {table}: {e}") 
+            else:
+                raise ImportError(f"Error importing {file_path.name}: {error_msg}")
+                
+    def _import_table(self, table: str) -> None:
+        """Import a single table.
+        
+        Args:
+            table: Name of table to import
+        """
+        logger.info(f"Importing table: {table}")
+        
+        # Get table metadata
+        metadata = self.db.get_table_metadata(table)
+        
+        # Create table if it doesn't exist
+        if not self.db.table_exists(table):
+            self.db.create_table(table, metadata.schema)
+            
+        # Import data
+        if self.config.disable_foreign_keys:
+            self.db.execute("SET FOREIGN_KEY_CHECKS=0")
+            
+        try:
+            # Configure parallel worker
+            worker_config = WorkerConfig(
+                max_workers=self.config.parallel_workers,
+                batch_size=self.config.batch_size
+            )
+            
+            # Import data in parallel
+            worker = ParallelWorker(worker_config)
+            worker.process_table(
+                table=table,
+                database=self.database,
+                input_file=Path(f"{table}.sql"),
+                disable_foreign_keys=self.config.disable_foreign_keys
+            )
+            
+        finally:
+            if self.config.disable_foreign_keys:
+                self.db.execute("SET FOREIGN_KEY_CHECKS=1") 

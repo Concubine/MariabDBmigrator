@@ -6,6 +6,7 @@ database:
   password: rootpassword
   database: testdb
   use_pure: true
+  auth_plugin: mysql_native_password  # MySQL authentication plugin to use
 
 # Export configuration
 export:
@@ -13,12 +14,23 @@ export:
   batch_size: 1000
   compression: false
   parallel_workers: $MAX_CPU_THREADS/2  # Use half of available CPU threads
+  tables: []  # Empty list means all tables
+  where: ""  # Empty string means no WHERE clause
+  exclude_schema: false
+  exclude_indexes: false
+  exclude_constraints: false
 
 # Import configuration
 import:
   batch_size: 1000
   compression: false
   parallel_workers: $MAX_CPU_THREADS/2  # Use half of available CPU threads
+  mode: skip  # Options: skip, overwrite, merge, cancel
+  exclude_schema: false
+  exclude_indexes: false
+  exclude_constraints: false
+  disable_foreign_keys: false
+  continue_on_error: false
 
 # Logging configuration
 logging:

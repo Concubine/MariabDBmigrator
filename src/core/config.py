@@ -17,6 +17,8 @@ class DatabaseConfig:
     user: str
     password: str
     database: str
+    use_pure: bool
+    auth_plugin: Optional[str]
 
 @dataclass
 class ExportConfig:
@@ -25,6 +27,30 @@ class ExportConfig:
     batch_size: int
     compression: bool
     parallel_workers: int
+    tables: list[str]
+    where: str
+    exclude_schema: bool
+    exclude_indexes: bool
+    exclude_constraints: bool
+    exclude_tables: list[str]
+    exclude_data: list[str]
+
+    def __init__(self, output_dir: str = 'exports', batch_size: int = 1000, compression: bool = False,
+                 parallel_workers: int = 1, tables: list[str] = None, where: str = '',
+                 exclude_schema: bool = False, exclude_indexes: bool = False,
+                 exclude_constraints: bool = False, exclude_tables: list[str] = None,
+                 exclude_data: list[str] = None):
+        self.output_dir = output_dir
+        self.batch_size = batch_size
+        self.compression = compression
+        self.parallel_workers = parallel_workers
+        self.tables = tables or []
+        self.where = where
+        self.exclude_schema = exclude_schema
+        self.exclude_indexes = exclude_indexes
+        self.exclude_constraints = exclude_constraints
+        self.exclude_tables = exclude_tables or []
+        self.exclude_data = exclude_data or []
 
 @dataclass
 class ImportConfig:
@@ -32,6 +58,32 @@ class ImportConfig:
     batch_size: int
     compression: bool
     parallel_workers: int
+    mode: str
+    exclude_schema: bool
+    exclude_indexes: bool
+    exclude_constraints: bool
+    disable_foreign_keys: bool
+    continue_on_error: bool
+    import_schema: bool
+    import_data: bool
+
+    def __init__(self, batch_size: int = 1000, compression: bool = False,
+                 parallel_workers: int = 1, mode: str = 'cancel',
+                 exclude_schema: bool = False, exclude_indexes: bool = False,
+                 exclude_constraints: bool = False, disable_foreign_keys: bool = False,
+                 continue_on_error: bool = False, import_schema: bool = True,
+                 import_data: bool = True):
+        self.batch_size = batch_size
+        self.compression = compression
+        self.parallel_workers = parallel_workers
+        self.mode = mode
+        self.exclude_schema = exclude_schema
+        self.exclude_indexes = exclude_indexes
+        self.exclude_constraints = exclude_constraints
+        self.disable_foreign_keys = disable_foreign_keys
+        self.continue_on_error = continue_on_error
+        self.import_schema = import_schema
+        self.import_data = import_data
 
 @dataclass
 class LoggingConfig:
@@ -82,7 +134,9 @@ def load_config(config_path: Optional[Path] = None) -> Config:
         port=db_config.get('port', 3306),
         user=db_config.get('user', 'root'),
         password=db_config.get('password', ''),
-        database=db_config.get('database', '')
+        database=db_config.get('database', ''),
+        use_pure=db_config.get('use_pure', True),
+        auth_plugin=db_config.get('auth_plugin')
     )
     
     # Load export config
@@ -91,7 +145,14 @@ def load_config(config_path: Optional[Path] = None) -> Config:
         output_dir=export_config.get('output_dir', 'exports'),
         batch_size=export_config.get('batch_size', 1000),
         compression=export_config.get('compression', False),
-        parallel_workers=parse_worker_count(export_config.get('parallel_workers', ''))
+        parallel_workers=parse_worker_count(export_config.get('parallel_workers', '')),
+        tables=export_config.get('tables', []),
+        where=export_config.get('where', ''),
+        exclude_schema=export_config.get('exclude_schema', False),
+        exclude_indexes=export_config.get('exclude_indexes', False),
+        exclude_constraints=export_config.get('exclude_constraints', False),
+        exclude_tables=export_config.get('exclude_tables', []),
+        exclude_data=export_config.get('exclude_data', [])
     )
     
     # Load import config
@@ -99,7 +160,15 @@ def load_config(config_path: Optional[Path] = None) -> Config:
     import_ = ImportConfig(
         batch_size=import_config.get('batch_size', 1000),
         compression=import_config.get('compression', False),
-        parallel_workers=parse_worker_count(import_config.get('parallel_workers', ''))
+        parallel_workers=parse_worker_count(import_config.get('parallel_workers', '')),
+        mode=import_config.get('mode', 'cancel'),
+        exclude_schema=import_config.get('exclude_schema', False),
+        exclude_indexes=import_config.get('exclude_indexes', False),
+        exclude_constraints=import_config.get('exclude_constraints', False),
+        disable_foreign_keys=import_config.get('disable_foreign_keys', False),
+        continue_on_error=import_config.get('continue_on_error', False),
+        import_schema=import_config.get('import_schema', True),
+        import_data=import_config.get('import_data', True)
     )
     
     # Load logging config
