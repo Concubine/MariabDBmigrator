@@ -3,10 +3,16 @@ database:
   host: localhost
   port: 3306
   user: root
-  password: rootpassword
-  database: testdb
+  password: ""
+  database: ""
   use_pure: true
   auth_plugin: mysql_native_password  # MySQL authentication plugin to use
+  ssl: false  # Whether to use SSL for the database connection
+  ssl_ca: null  # Path to CA certificate file
+  ssl_cert: null  # Path to client certificate file
+  ssl_key: null  # Path to client key file
+  ssl_verify_cert: false  # Whether to verify server certificate
+  ssl_verify_identity: false  # Whether to verify server identity
 
 # Export configuration
 export:
@@ -22,6 +28,7 @@ export:
 
 # Import configuration
 import:
+  input_dir: exports  # Same as export.output_dir by default
   batch_size: 1000
   compression: false
   parallel_workers: $MAX_CPU_THREADS/2  # Use half of available CPU threads

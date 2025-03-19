@@ -44,29 +44,70 @@ class ExportService:
             # Connect to database
             self.db.connect()
             
-            # Get tables to export
-            tables_to_export = self._get_tables_to_export()
-            if not tables_to_export:
-                logger.warning("No tables found to export")
-                return []
-                
-            logger.info(f"Found {len(tables_to_export)} tables to export")
+            # Special case for information_schema
+            if hasattr(self.config, 'include_information_schema') and self.config.include_information_schema:
+                logger.info("Exporting information_schema tables")
+                self.db.select_database('information_schema')
+                info_schema_results = self._export_database_tables()
+                return info_schema_results
             
-            # Export each table
-            results = []
-            for table in tables_to_export:
-                result = self._export_single_table(table)
-                results.append(result)
+            # Handle the case when no specific database is selected
+            if 'database' not in self.db.config or not self.db.config.get('database', ''):
+                # List available databases
+                databases = self.db.get_available_databases()
+                # Filter out system databases
+                user_databases = [db for db in databases if db not in ['information_schema', 'mysql', 'performance_schema', 'sys']]
                 
-            logger.info("Export completed successfully")
-            return results
+                if not user_databases:
+                    logger.warning("No user databases found to export")
+                    return []
+                    
+                logger.info(f"Found {len(user_databases)} databases available for export")
+                logger.info(f"Available databases: {', '.join(user_databases)}")
+                
+                # If no specific database was chosen, we'll need to handle each database separately
+                results = []
+                for db_name in user_databases:
+                    self.db.select_database(db_name)
+                    logger.info(f"Exporting database: {db_name}")
+                    # Get tables to export for this database
+                    db_results = self._export_database_tables()
+                    results.extend(db_results)
+                
+                return results
+            else:
+                # Normal export of the specified database
+                return self._export_database_tables()
             
         except Exception as e:
             raise ExportError(f"Export failed: {str(e)}")
             
         finally:
             self.db.disconnect()
+
+    def _export_database_tables(self) -> List[ExportResult]:
+        """Export tables from the currently selected database.
+        
+        Returns:
+            List of export results
+        """
+        # Get tables to export
+        tables_to_export = self._get_tables_to_export()
+        if not tables_to_export:
+            logger.warning(f"No tables found to export in database {self.db.config.get('database', '')}")
+            return []
             
+        logger.info(f"Found {len(tables_to_export)} tables to export in database {self.db.config.get('database', '')}")
+        
+        # Export each table
+        results = []
+        for table in tables_to_export:
+            result = self._export_single_table(table)
+            results.append(result)
+            
+        logger.info(f"Export completed successfully for database {self.db.config.get('database', '')}")
+        return results
+        
     def _get_tables_to_export(self) -> List[str]:
         """Get list of tables to export.
         

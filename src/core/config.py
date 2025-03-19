@@ -15,10 +15,16 @@ class DatabaseConfig:
     host: str
     port: int
     user: str
-    password: str
-    database: str
-    use_pure: bool
-    auth_plugin: Optional[str]
+    password: str = ""
+    database: str = ""  # Optional with default empty string
+    use_pure: bool = True  # Add default value
+    auth_plugin: Optional[str] = None  # Already has default None
+    ssl: bool = False  # Add default value
+    ssl_ca: Optional[str] = None  # Already has default None
+    ssl_cert: Optional[str] = None  # Already has default None
+    ssl_key: Optional[str] = None  # Already has default None
+    ssl_verify_cert: bool = False  # Add default value
+    ssl_verify_identity: bool = False  # Add default value
 
 @dataclass
 class ExportConfig:
@@ -34,12 +40,13 @@ class ExportConfig:
     exclude_constraints: bool
     exclude_tables: list[str]
     exclude_data: list[str]
+    include_information_schema: bool
 
     def __init__(self, output_dir: str = 'exports', batch_size: int = 1000, compression: bool = False,
                  parallel_workers: int = 1, tables: list[str] = None, where: str = '',
                  exclude_schema: bool = False, exclude_indexes: bool = False,
                  exclude_constraints: bool = False, exclude_tables: list[str] = None,
-                 exclude_data: list[str] = None):
+                 exclude_data: list[str] = None, include_information_schema: bool = False):
         self.output_dir = output_dir
         self.batch_size = batch_size
         self.compression = compression
@@ -51,10 +58,12 @@ class ExportConfig:
         self.exclude_constraints = exclude_constraints
         self.exclude_tables = exclude_tables or []
         self.exclude_data = exclude_data or []
+        self.include_information_schema = include_information_schema
 
 @dataclass
 class ImportConfig:
     """Import operation configuration."""
+    input_dir: str
     batch_size: int
     compression: bool
     parallel_workers: int
@@ -67,12 +76,13 @@ class ImportConfig:
     import_schema: bool
     import_data: bool
 
-    def __init__(self, batch_size: int = 1000, compression: bool = False,
+    def __init__(self, input_dir: str = 'exports', batch_size: int = 1000, compression: bool = False,
                  parallel_workers: int = 1, mode: str = 'cancel',
                  exclude_schema: bool = False, exclude_indexes: bool = False,
                  exclude_constraints: bool = False, disable_foreign_keys: bool = False,
                  continue_on_error: bool = False, import_schema: bool = True,
                  import_data: bool = True):
+        self.input_dir = input_dir
         self.batch_size = batch_size
         self.compression = compression
         self.parallel_workers = parallel_workers
@@ -153,7 +163,13 @@ def load_config(config_path: Optional[Path] = None) -> Config:
         password=db_config.get('password', ''),
         database=db_config.get('database', ''),
         use_pure=db_config.get('use_pure', True),
-        auth_plugin=db_config.get('auth_plugin')
+        auth_plugin=db_config.get('auth_plugin'),
+        ssl=db_config.get('ssl', False),
+        ssl_ca=db_config.get('ssl_ca', None),
+        ssl_cert=db_config.get('ssl_cert', None),
+        ssl_key=db_config.get('ssl_key', None),
+        ssl_verify_cert=db_config.get('ssl_verify_cert', False),
+        ssl_verify_identity=db_config.get('ssl_verify_identity', False)
     )
     
     # Load export config
@@ -169,12 +185,14 @@ def load_config(config_path: Optional[Path] = None) -> Config:
         exclude_indexes=export_config.get('exclude_indexes', False),
         exclude_constraints=export_config.get('exclude_constraints', False),
         exclude_tables=export_config.get('exclude_tables', []),
-        exclude_data=export_config.get('exclude_data', [])
+        exclude_data=export_config.get('exclude_data', []),
+        include_information_schema=export_config.get('include_information_schema', False)
     )
     
     # Load import config
     import_config = config_dict.get('import', {})
     import_ = ImportConfig(
+        input_dir=import_config.get('input_dir', export.output_dir),
         batch_size=import_config.get('batch_size', 1000),
         compression=import_config.get('compression', False),
         parallel_workers=parse_worker_count(import_config.get('parallel_workers', '')),

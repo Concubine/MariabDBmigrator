@@ -94,6 +94,15 @@ def log_config(config: dict) -> None:
     logger.info(f"  Database: {db_config.get('database', '')}")
     logger.info(f"  Use Pure: {db_config.get('use_pure', True)}")
     logger.info(f"  Auth Plugin: {db_config.get('auth_plugin', 'mysql_native_password')}")
+    logger.info(f"  SSL: {db_config.get('ssl', False)}")
+    
+    # Log SSL details only if SSL is enabled
+    if db_config.get('ssl', False):
+        logger.info(f"  SSL CA: {db_config.get('ssl_ca', None)}")
+        logger.info(f"  SSL Cert: {db_config.get('ssl_cert', None)}")
+        logger.info(f"  SSL Key: {db_config.get('ssl_key', None)}")
+        logger.info(f"  SSL Verify Cert: {db_config.get('ssl_verify_cert', False)}")
+        logger.info(f"  SSL Verify Identity: {db_config.get('ssl_verify_identity', False)}")
     
     # Log export configuration
     export_config = config.get('export', {})
@@ -113,6 +122,7 @@ def log_config(config: dict) -> None:
     # Log import configuration
     import_config = config.get('import', {})
     logger.info("Import Configuration:")
+    logger.info(f"  Input Directory: {import_config.get('input_dir', 'exports')}")
     logger.info(f"  Batch Size: {import_config.get('batch_size', 1000)}")
     logger.info(f"  Compression: {import_config.get('compression', False)}")
     logger.info(f"  Parallel Workers: {import_config.get('parallel_workers', '')}")

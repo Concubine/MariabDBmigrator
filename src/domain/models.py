@@ -14,6 +14,12 @@ class DatabaseConfig:
     database: str
     use_pure: bool = True
     auth_plugin: Optional[str] = None
+    ssl: bool = False
+    ssl_ca: Optional[str] = None
+    ssl_cert: Optional[str] = None
+    ssl_key: Optional[str] = None
+    ssl_verify_cert: bool = False
+    ssl_verify_identity: bool = False
 
 class ImportMode(Enum):
     """Import mode for handling existing tables."""
