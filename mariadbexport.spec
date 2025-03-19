@@ -1,15 +1,29 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-import os
-
 a = Analysis(
     ['C:\\Users\\plotk\\aihelp\\mariadbexport\\MDB2\\src\\main.py'],
     pathex=['C:\\Users\\plotk\\aihelp\\mariadbexport\\MDB2'],
     binaries=[],
-    datas=[
-        ('config/config.yaml', 'config'),
-    ],
-    hiddenimports=['src', 'src.core.config', 'src.core.exceptions', 'src.domain.models', 'src.infrastructure.mariadb', 'src.infrastructure.storage', 'src.services.export', 'src.services.import_', 'yaml', 'mysql.connector', 'mysql.connector.plugins', 'mysql.connector.plugins.mysql_native_password', 'sqlparse'],
+    datas=[(r'C:\Users\plotk\aihelp\mariadbexport\MDB2\config\config.yaml', 'config')],
+    hiddenimports=[
+    'src', 
+    'src.core.config', 
+    'src.core.exceptions', 
+    'src.domain.models', 
+    'src.infrastructure.mariadb', 
+    'src.infrastructure.storage', 
+    'src.services.export', 
+    'src.services.import_', 
+    'yaml', 
+    'mysql.connector', 
+    'sqlparse',
+    'sqlparse.engine',
+    'sqlparse.formatter',
+    'sqlparse.keywords',
+    'sqlparse.lexer',
+    'sqlparse.sql',
+    'sqlparse.tokens',
+    'sqlparse.utils'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -39,6 +53,3 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
 )
-
-# Ensure config directory exists in dist
-os.makedirs('dist/config', exist_ok=True)

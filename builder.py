@@ -88,7 +88,11 @@ def build_executable(python_path: str, main_script: Path) -> None:
 def copy_config(config_path: Path, dist_path: Path) -> None:
     """Copy the config file to the dist folder."""
     print("Copying config file...")
-    shutil.copy2(config_path, dist_path / "config.yaml")
+    # Create config directory in dist folder
+    config_dir = dist_path / "config"
+    config_dir.mkdir(exist_ok=True)
+    # Copy config file to config/config.yaml
+    shutil.copy2(config_path, config_dir / "config.yaml")
 
 def main() -> None:
     """Main build process."""

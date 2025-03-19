@@ -60,9 +60,11 @@ def main() -> int:
     config_path = Path(args.config) if args.config else None
     config = load_config(config_path)
     
-    # Set up logging
-    if args.verbose:
+    # Set up logging - preserve config file level unless verbose flag is used
+    original_level = config.logging.level  # Store original level from config
+    if args.verbose and original_level != "DEBUG":
         config.logging.level = "DEBUG"
+        logging.info(f"Overriding log level from {original_level} to DEBUG due to --verbose flag")
     setup_logging(config.logging)
     
     # Log configuration

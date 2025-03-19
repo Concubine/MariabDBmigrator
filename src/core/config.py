@@ -101,8 +101,25 @@ class Config:
     logging: LoggingConfig
 
 def get_default_config_path() -> Path:
-    """Get the default configuration file path."""
-    # Get the base directory for the application
+    """Get the default configuration file path.
+    
+    First checks for a config file in the same directory as the executable,
+    then falls back to the bundled config file.
+    """
+    # Get the directory containing the executable
+    if getattr(sys, 'frozen', False):
+        # Running as compiled executable
+        exe_dir = Path(sys.executable).parent
+    else:
+        # Running as script
+        exe_dir = Path(__file__).parent.parent.parent
+        
+    # First check for external config in the same directory as executable
+    external_config = exe_dir / "config" / "config.yaml"
+    if external_config.exists():
+        return external_config
+        
+    # Fall back to bundled config
     base_dir = getattr(sys, '_MEIPASS', Path(__file__).parent.parent.parent)
     return Path(base_dir) / "config" / "config.yaml"
 
