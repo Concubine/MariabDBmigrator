@@ -6,8 +6,10 @@ import re
 from typing import Callable, List, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
 
 from src.core.logging import get_logger
+from src.infrastructure.mariadb import MariaDB
 
 logger = get_logger(__name__)
 
@@ -16,7 +18,7 @@ class WorkerConfig:
     """Configuration for parallel workers."""
     max_workers: int
     use_processes: bool = False
-    chunk_size: int = 1
+    batch_size: int = 1000
 
 class ParallelWorker:
     """Manages parallel execution of tasks using either threads or processes."""
@@ -60,10 +62,52 @@ class ParallelWorker:
         results = list(self._executor.map(
             func,
             items,
-            chunksize=self.config.chunk_size
+            chunksize=self.config.batch_size
         ))
         logger.debug("Parallel processing completed")
         return results
+        
+    def process_table(self, table: str, database: Any, input_file: Path, disable_foreign_keys: bool = False) -> int:
+        """Process a table by importing data from a SQL file.
+        
+        Args:
+            table: Name of the table to import
+            database: Database configuration 
+            input_file: Path to the SQL file
+            disable_foreign_keys: Whether to disable foreign key checks
+            
+        Returns:
+            Number of rows imported
+        """
+        logger.info(f"Processing table {table} from {input_file}")
+        
+        if not input_file.exists():
+            logger.error(f"Input file not found: {input_file}")
+            return 0
+            
+        # Create a new database connection for this process
+        db = MariaDB(database)
+        
+        try:
+            db.connect()
+            
+            if disable_foreign_keys:
+                db.execute("SET FOREIGN_KEY_CHECKS=0")
+                
+            # Import data from file
+            total_rows = db.import_table_data(table, str(input_file), self.config.batch_size)
+            
+            logger.info(f"Imported {total_rows} rows into table {table}")
+            return total_rows
+            
+        except Exception as e:
+            logger.error(f"Error processing table {table}: {str(e)}")
+            raise
+            
+        finally:
+            if disable_foreign_keys:
+                db.execute("SET FOREIGN_KEY_CHECKS=1")
+            db.disconnect()
 
 def get_optimal_worker_count(use_processes: bool = False) -> int:
     """Calculate optimal number of workers based on system resources.

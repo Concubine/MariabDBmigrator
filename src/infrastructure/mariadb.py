@@ -707,8 +707,37 @@ class MariaDB(DatabaseInterface):
         """Get list of all table names."""
         try:
             self._ensure_connected()
-            self._cursor.execute("SHOW TABLES")
-            return [row[list(row.keys())[0]] for row in self._cursor.fetchall()]
+            
+            # Ensure we're querying the correct database
+            current_db = self.config.get('database', '')
+            if not current_db:
+                # If no database is selected, use INFORMATION_SCHEMA to list tables across all databases
+                logger.warning("No database selected, using INFORMATION_SCHEMA to list tables")
+                self._cursor.execute("""
+                    SELECT TABLE_NAME
+                    FROM INFORMATION_SCHEMA.TABLES
+                    WHERE TABLE_SCHEMA NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+                """)
+                tables = [row['TABLE_NAME'] for row in self._cursor.fetchall()]
+            else:
+                # Use SHOW TABLES for the current database
+                logger.debug(f"Getting tables for database: {current_db}")
+                self._cursor.execute("SHOW TABLES")
+                tables = [row[list(row.keys())[0]] for row in self._cursor.fetchall()]
+                
+                # If no tables found using SHOW TABLES, try INFORMATION_SCHEMA as a fallback
+                if not tables:
+                    logger.debug("No tables found with SHOW TABLES, trying INFORMATION_SCHEMA")
+                    self._cursor.execute("""
+                        SELECT TABLE_NAME
+                        FROM INFORMATION_SCHEMA.TABLES
+                        WHERE TABLE_SCHEMA = %s
+                    """, (current_db,))
+                    tables = [row['TABLE_NAME'] for row in self._cursor.fetchall()]
+            
+            logger.debug(f"Found {len(tables)} tables: {', '.join(tables)}")
+            return tables
+            
         except Error as e:
             raise DatabaseError(f"Failed to get table names: {str(e)}")
     
@@ -900,6 +929,19 @@ class MariaDB(DatabaseInterface):
         except Error as e:
             raise DatabaseError(f"Failed to get data from table {table_name}: {str(e)}")
     
+    def execute(self, query: str) -> None:
+        """Execute a SQL statement.
+        
+        Args:
+            query: SQL statement to execute
+        """
+        try:
+            self._ensure_connected()
+            self._cursor.execute(query)
+            self._connection.commit()
+        except Error as e:
+            raise DatabaseError(f"Failed to execute query: {str(e)}")
+
     def execute_query(self, query: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """Execute a query and return the results.
         

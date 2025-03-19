@@ -33,6 +33,7 @@ import:
   compression: false
   parallel_workers: $MAX_CPU_THREADS/2  # Use half of available CPU threads
   mode: skip  # Options: skip, overwrite, merge, cancel
+  database: ""
   exclude_schema: false
   exclude_indexes: false
   exclude_constraints: false

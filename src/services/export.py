@@ -117,13 +117,23 @@ class ExportService:
         # Get all tables from database
         all_tables = self.db.get_table_names()
         
+        # Log actual tables found for debugging
+        logger.debug(f"All tables found in database: {', '.join(all_tables)}")
+        
         # Filter tables based on configuration
         if self.config.tables:
             # Export only specified tables
             tables = [t for t in all_tables if t in self.config.tables]
+            logger.debug(f"Filtered to specified tables: {', '.join(tables)}")
         else:
             # Export all tables except excluded ones
             tables = [t for t in all_tables if t not in self.config.exclude_tables]
+            logger.debug(f"Filtered excluding tables: {', '.join(tables)}")
+            
+        # Ensure we don't have an empty list due to case sensitivity issues
+        if not tables and all_tables:
+            logger.warning(f"No tables matched after filtering. Using all available tables.")
+            tables = all_tables
             
         return tables
         
@@ -158,7 +168,7 @@ class ExportService:
             # Configure parallel worker
             worker_config = WorkerConfig(
                 max_workers=self.config.parallel_workers,
-                chunk_size=self.config.batch_size
+                batch_size=self.config.batch_size
             )
             
             # Export data in parallel
