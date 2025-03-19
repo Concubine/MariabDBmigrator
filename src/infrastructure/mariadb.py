@@ -841,8 +841,10 @@ class MariaDB(DatabaseInterface):
             
             # Get CREATE TABLE statement
             self._cursor.execute(f"SHOW CREATE TABLE {table_name}")
-            schema = self._cursor.fetchone()['Create Table']
+            create_table_info = self._cursor.fetchone()
+            schema = create_table_info['Create Table']
             
+            # Return TableMetadata with both schema and definition fields
             return TableMetadata(
                 name=table_name,
                 columns=column_names,
@@ -850,7 +852,8 @@ class MariaDB(DatabaseInterface):
                 foreign_keys=foreign_keys,
                 indexes=indexes,
                 constraints=constraints,
-                schema=schema
+                schema=schema,
+                definition=schema  # Include definition field with the same content as schema
             )
             
         except Error as e:
@@ -1131,17 +1134,33 @@ class MariaDB(DatabaseInterface):
             return [row[list(row.keys())[0]] for row in self._cursor.fetchall()]
         except Error as e:
             raise DatabaseError(f"Failed to get database names: {str(e)}")
-    
-    def select_database(self, database_name: str) -> None:
-        """Select a database to use.
+            
+    def get_current_database(self) -> str:
+        """Get the name of the currently selected database.
         
-        Args:
-            database_name: Name of the database to select
+        Returns:
+            Current database name or empty string if none is selected
         """
         try:
             self._ensure_connected()
-            self._cursor.execute(f"USE {database_name}")
-            self.config['database'] = database_name
-            logger.info(f"Selected database: {database_name}")
+            self._cursor.execute("SELECT DATABASE()")
+            result = self._cursor.fetchone()
+            if result and result.get('DATABASE()'):
+                return result['DATABASE()']
+            return ""
         except Error as e:
-            raise DatabaseError(f"Failed to select database {database_name}: {str(e)}") 
+            raise DatabaseError(f"Failed to get current database: {str(e)}")
+            
+    def select_database(self, database: str) -> None:
+        """Select a database to use.
+        
+        Args:
+            database: Name of the database to select
+        """
+        try:
+            self._ensure_connected()
+            self._cursor.execute(f"USE `{database}`")
+            # Update the database name in config
+            self.config['database'] = database
+        except Error as e:
+            raise DatabaseError(f"Failed to select database {database}: {str(e)}") 

@@ -75,13 +75,14 @@ class ImportConfig:
     continue_on_error: bool
     import_schema: bool
     import_data: bool
+    database: str = ""  # Target database for import
 
     def __init__(self, input_dir: str = 'exports', batch_size: int = 1000, compression: bool = False,
                  parallel_workers: int = 1, mode: str = 'cancel',
                  exclude_schema: bool = False, exclude_indexes: bool = False,
-                 exclude_constraints: bool = False, disable_foreign_keys: bool = False,
+                 exclude_constraints: bool = False, disable_foreign_keys: bool = True,
                  continue_on_error: bool = False, import_schema: bool = True,
-                 import_data: bool = True):
+                 import_data: bool = True, database: str = ""):
         self.input_dir = input_dir
         self.batch_size = batch_size
         self.compression = compression
@@ -94,6 +95,7 @@ class ImportConfig:
         self.continue_on_error = continue_on_error
         self.import_schema = import_schema
         self.import_data = import_data
+        self.database = database
 
 @dataclass
 class LoggingConfig:
@@ -200,10 +202,11 @@ def load_config(config_path: Optional[Path] = None) -> Config:
         exclude_schema=import_config.get('exclude_schema', False),
         exclude_indexes=import_config.get('exclude_indexes', False),
         exclude_constraints=import_config.get('exclude_constraints', False),
-        disable_foreign_keys=import_config.get('disable_foreign_keys', False),
+        disable_foreign_keys=import_config.get('disable_foreign_keys', True),
         continue_on_error=import_config.get('continue_on_error', False),
         import_schema=import_config.get('import_schema', True),
-        import_data=import_config.get('import_data', True)
+        import_data=import_config.get('import_data', True),
+        database=import_config.get('database', '')
     )
     
     # Load logging config

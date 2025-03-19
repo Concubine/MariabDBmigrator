@@ -2,6 +2,7 @@
 import gzip
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+import logging
 import sqlparse
 from sqlparse.sql import TokenList, Token
 
@@ -9,8 +10,22 @@ from ..core.exceptions import StorageError
 from ..domain.interfaces import StorageInterface
 from ..domain.models import TableMetadata, ColumnMetadata
 
+logger = logging.getLogger(__name__)
+
 class SQLStorage(StorageInterface):
     """SQL file storage implementation."""
+    
+    # Define expected metadata fields with defaults
+    EXPECTED_TABLE_METADATA = {
+        'name': '',
+        'columns': [],
+        'primary_key': [],
+        'foreign_keys': [],
+        'indexes': [],
+        'constraints': [],
+        'schema': None,
+        'definition': '',  # This is the field that was missing
+    }
     
     def save_data(
         self,
@@ -175,40 +190,77 @@ class SQLStorage(StorageInterface):
             file_path: Path to save schema to
             metadata: Table metadata
         """
-        # Generate CREATE TABLE statement
-        schema = f"CREATE TABLE {metadata.name} (\n"
-        
-        # Add columns
-        column_defs = []
-        for column in metadata.columns:
-            column_defs.append(f"  {column}")
-        
-        # Add primary key if present
-        if metadata.primary_key:
-            pk_cols = ', '.join(metadata.primary_key)
-            column_defs.append(f"  PRIMARY KEY ({pk_cols})")
+        try:
+            # Create a complete metadata dictionary with all expected fields
+            metadata_dict = {}
             
-        # Add foreign keys
-        for fk in metadata.foreign_keys:
-            fk_def = f"  FOREIGN KEY ({fk['column']}) REFERENCES {fk['ref_table']}({fk['ref_column']})"
-            if 'on_delete' in fk:
-                fk_def += f" ON DELETE {fk['on_delete']}"
-            if 'on_update' in fk:
-                fk_def += f" ON UPDATE {fk['on_update']}"
-            column_defs.append(fk_def)
+            # First populate from the metadata object attributes
+            for field in self.EXPECTED_TABLE_METADATA:
+                if hasattr(metadata, field):
+                    metadata_dict[field] = getattr(metadata, field)
             
-        # Add indexes
-        for idx in metadata.indexes:
-            idx_def = f"  INDEX {idx['name']} ({', '.join(idx['columns'])})"
-            column_defs.append(idx_def)
+            # Handle missing fields
+            missing_fields = [field for field in self.EXPECTED_TABLE_METADATA.keys() 
+                            if field not in metadata_dict]
+            if missing_fields:
+                logger.debug(f"Missing expected metadata fields for table '{metadata_dict.get('name', 'unknown')}': {', '.join(missing_fields)}")
             
-        # Add constraints
-        for constraint in metadata.constraints:
-            constraint_def = f"  CONSTRAINT {constraint['name']} {constraint['definition']}"
-            column_defs.append(constraint_def)
+            # Add defaults for missing fields
+            for field in missing_fields:
+                metadata_dict[field] = self.EXPECTED_TABLE_METADATA[field]
+                
+            # If we have schema but no definition, use schema as definition
+            if metadata_dict.get('schema') and not metadata_dict.get('definition'):
+                metadata_dict['definition'] = metadata_dict['schema']
+                
+            # If we have definition but no schema, use definition as schema
+            if metadata_dict.get('definition') and not metadata_dict.get('schema'):
+                metadata_dict['schema'] = metadata_dict['definition']
             
-        schema += ',\n'.join(column_defs)
-        schema += "\n);"
-        
-        # Save schema
-        self.save_schema(schema, file_path, compression=False) 
+            # Use direct schema or definition if available
+            if metadata_dict.get('schema') or metadata_dict.get('definition'):
+                schema = metadata_dict.get('schema') or metadata_dict.get('definition')
+                self.save_schema(schema, file_path, compression=False)
+                return
+                
+            # Otherwise, generate CREATE TABLE statement from metadata
+            schema = f"CREATE TABLE {metadata_dict['name']} (\n"
+            
+            # Add columns
+            column_defs = []
+            for column in metadata_dict['columns']:
+                column_defs.append(f"  {column}")
+            
+            # Add primary key if present
+            if metadata_dict['primary_key']:
+                pk_cols = ', '.join(metadata_dict['primary_key'])
+                column_defs.append(f"  PRIMARY KEY ({pk_cols})")
+                
+            # Add foreign keys
+            for fk in metadata_dict['foreign_keys']:
+                fk_def = f"  FOREIGN KEY ({fk['column']}) REFERENCES {fk['ref_table']}({fk['ref_column']})"
+                if 'on_delete' in fk:
+                    fk_def += f" ON DELETE {fk['on_delete']}"
+                if 'on_update' in fk:
+                    fk_def += f" ON UPDATE {fk['on_update']}"
+                column_defs.append(fk_def)
+                
+            # Add indexes
+            for idx in metadata_dict['indexes']:
+                idx_def = f"  INDEX {idx['name']} ({', '.join(idx['columns'])})"
+                column_defs.append(idx_def)
+                
+            # Add constraints
+            for constraint in metadata_dict['constraints']:
+                constraint_def = f"  CONSTRAINT {constraint['name']} {constraint.get('definition', '')}"
+                column_defs.append(constraint_def)
+                
+            schema += ',\n'.join(column_defs)
+            schema += "\n);"
+            
+            # Save schema
+            self.save_schema(schema, file_path, compression=False)
+            
+        except Exception as e:
+            logger.error(f"Failed to write schema for {metadata.name}: {str(e)}", exc_info=True)
+            raise StorageError(f"Failed to write schema: {str(e)}") 

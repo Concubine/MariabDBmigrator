@@ -38,6 +38,7 @@ def parse_args() -> argparse.Namespace:
     import_parser = subparsers.add_parser("import", help="Import database tables")
     import_parser.add_argument("files", nargs="*", help="SQL files to import (if not specified, all files in input-dir will be used)")
     import_parser.add_argument("--input-dir", help="Directory containing SQL files to import (default: same as export output-dir)")
+    import_parser.add_argument("--database", help="Target database for import (overrides automatic detection)")
     import_parser.add_argument("--mode", choices=["skip", "overwrite", "merge", "cancel"], help="Import mode")
     import_parser.add_argument("--batch-size", type=int, help="Number of rows per batch")
     import_parser.add_argument("--compression", action="store_true", help="Enable compression")
@@ -170,6 +171,10 @@ def main() -> int:
             # Override config with command line arguments
             if args.input_dir:
                 config.import_.input_dir = args.input_dir
+            if args.database:
+                # Set both the import config database and the database config database
+                config.import_.database = args.database
+                config.database.database = args.database
             if args.mode:
                 config.import_.mode = args.mode
             if args.batch_size:

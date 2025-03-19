@@ -38,6 +38,7 @@ class TableMetadata:
     indexes: List[Dict[str, Any]]
     constraints: List[Dict[str, Any]]
     schema: Optional[str] = None
+    definition: Optional[str] = None
 
 @dataclass
 class ColumnMetadata:

@@ -3,9 +3,9 @@ database:
   host: localhost
   port: 3306
   user: root
-  password: ""
+  password: "rootpassword"
   database: ""
-  use_pure: true
+  use_pure: false #Uses the pure Python implementation (MySQLConnection)
   auth_plugin: mysql_native_password  # MySQL authentication plugin to use
   ssl: false  # Whether to use SSL for the database connection
   ssl_ca: null  # Path to CA certificate file
