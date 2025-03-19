@@ -1,39 +1,44 @@
 """Main entry point for the MariaDB export tool."""
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import List, Optional
 
-from .core.config import load_config
-from .core.exceptions import ConfigError, ExportError, ImportError
-from .domain.models import ExportOptions, ImportOptions, ImportMode
-from .infrastructure.mariadb import MariaDB
-from .infrastructure.storage import SQLStorage
-from .services.export import ExportService
-from .services.import_ import ImportService
+# Add the root directory to sys.path to ensure imports work in both
+# development and when bundled as an executable
+root_dir = Path(__file__).parent.parent
+if str(root_dir) not in sys.path:
+    sys.path.insert(0, str(root_dir))
 
-def setup_logging(level: str = "INFO") -> None:
+from src.core.config import load_config
+from src.core.exceptions import ConfigError, ExportError, ImportError
+from src.domain.models import ExportOptions, ImportOptions, ImportMode, DatabaseConfig
+from src.infrastructure.mariadb import MariaDB
+from src.infrastructure.storage import SQLStorage
+from src.services.export import ExportService
+from src.services.import_ import ImportService
+
+logger = logging.getLogger(__name__)
+
+def setup_logging(level: str = "INFO", log_file: Optional[str] = None) -> None:
     """Set up logging configuration."""
     logging.basicConfig(
         level=level,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        filename=log_file
     )
 
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(
-        description="Export and import data from/to MariaDB using SQL format"
-    )
+    parser = argparse.ArgumentParser(description="MariaDB Export Tool")
+    subparsers = parser.add_subparsers(dest="command", help="Command to execute")
     
-    subparsers = parser.add_subparsers(dest="mode", help="Operation mode")
-    
-    # Export mode
+    # Export command
     export_parser = subparsers.add_parser("export", help="Export data from MariaDB")
     export_parser.add_argument(
         "--output-dir",
-        type=Path,
-        required=True,
         help="Output directory for exported files"
     )
     export_parser.add_argument(
@@ -44,7 +49,6 @@ def parse_args() -> argparse.Namespace:
     export_parser.add_argument(
         "--batch-size",
         type=int,
-        default=1000,
         help="Number of rows to export in each batch"
     )
     export_parser.add_argument(
@@ -71,211 +75,69 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Compress output files"
     )
-    
-    # Import mode
-    import_parser = subparsers.add_parser("import", help="Import data into MariaDB")
-    import_parser.add_argument(
-        "--input",
-        type=Path,
-        required=True,
-        help="Input directory containing SQL files"
-    )
-    import_parser.add_argument(
-        "--tables",
-        nargs="+",
-        help="List of tables to import (default: all tables)"
-    )
-    import_parser.add_argument(
-        "--import-mode",
-        choices=[mode.value for mode in ImportMode],
-        default=ImportMode.SKIP.value,
-        help=(
-            "How to handle existing tables: "
-            "skip - Skip if table exists (default), "
-            "overwrite - Drop and recreate if exists, "
-            "merge - Keep structure but append data, "
-            "cancel - Stop if any table exists"
-        )
-    )
-    import_parser.add_argument(
-        "--batch-size",
+    export_parser.add_argument(
+        "--parallel-workers",
         type=int,
-        default=1000,
-        help="Number of rows to import in each batch"
-    )
-    import_parser.add_argument(
-        "--no-schema",
-        action="store_true",
-        help="Do not import table schemas"
-    )
-    import_parser.add_argument(
-        "--no-indexes",
-        action="store_true",
-        help="Do not import indexes"
-    )
-    import_parser.add_argument(
-        "--no-constraints",
-        action="store_true",
-        help="Do not import constraints"
-    )
-    import_parser.add_argument(
-        "--keep-foreign-keys",
-        action="store_true",
-        help="Do not disable foreign keys during import"
-    )
-    import_parser.add_argument(
-        "--continue-on-error",
-        action="store_true",
-        help="Continue importing other tables if an error occurs"
-    )
-    import_parser.add_argument(
-        "--compress",
-        action="store_true",
-        help="Input files are compressed"
+        help="Number of parallel workers for export"
     )
     
-    # Common options
-    parser.add_argument(
-        "--config",
-        type=Path,
-        default=Path("config/config.yaml"),
-        help="Path to configuration file"
-    )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable debug logging"
-    )
-    
-    # Debug logging for arguments
-    logger = logging.getLogger(__name__)
-    logger.debug(f"Command line arguments: {sys.argv}")
-    
-    # Handle module import case
-    if len(sys.argv) > 1 and sys.argv[1] in ["export", "import"]:
-        args = parser.parse_args()
-    else:
-        args = parser.parse_args(sys.argv[1:])
-    
-    logger.debug(f"Parsed arguments: {args}")
-    
-    return args
+    return parser.parse_args()
 
 def main() -> None:
     """Main entry point."""
     try:
-        # Set up logging first
-        setup_logging("DEBUG")
-        logger = logging.getLogger(__name__)
-        
-        # Parse arguments
+        # Parse command line arguments
         args = parse_args()
+        if not args.command:
+            print("No command specified. Use --help for usage information.")
+            sys.exit(1)
         
-        if not args.mode:
-            logger.error("No operation mode specified")
-            return 1
-            
         # Load configuration
-        config = load_config(args.config)
+        config = load_config()
         
-        # Create database connection
-        database = MariaDB(config.database)
+        # Set up logging
+        setup_logging(
+            level=config.logging.level,
+            log_file=config.logging.file if config.logging.file else None
+        )
         
-        # Create storage
-        storage = SQLStorage()
+        # Create database config
+        db_config = DatabaseConfig(
+            host=config.database.host,
+            port=config.database.port,
+            user=config.database.user,
+            password=config.database.password,
+            database=config.database.database,
+            use_pure=True
+        )
         
-        if args.mode == "export":
-            # Create export options
-            export_options = ExportOptions(
-                batch_size=args.batch_size,
-                where_clause=args.where,
-                include_schema=not args.no_schema,
-                include_indexes=not args.no_indexes,
-                include_constraints=not args.no_constraints,
-                compression=args.compress
-            )
-            
+        if args.command == "export":
             # Create export service
-            export_service = ExportService(database, storage)
-            
-            # Get tables to export
-            tables = args.tables or database.get_table_names()
-            
-            # Export tables
-            results = export_service.export_tables(
-                tables,
-                args.output_dir,
-                export_options
+            service = ExportService(
+                config=db_config,
+                output_dir=args.output_dir or config.export.output_dir,
+                tables=args.tables,
+                batch_size=args.batch_size or config.export.batch_size,
+                where_clause=args.where,
+                exclude_schema=args.no_schema,
+                exclude_indexes=args.no_indexes,
+                exclude_constraints=args.no_constraints,
+                compress=args.compress or config.export.compression,
+                parallel_workers=args.parallel_workers or config.export.parallel_workers
             )
             
-            # Print summary
-            logger.info("Export completed successfully:")
-            for result in results:
-                logger.info(
-                    f"Table {result.table_name}: {result.total_rows} rows"
-                )
-                if result.schema_file:
-                    logger.info(f"Schema saved to {result.schema_file}")
-                logger.info(f"Data saved to {result.data_file}")
-        
-        elif args.mode == "import":
-            # Create import options
-            import_options = ImportOptions(
-                mode=ImportMode(args.import_mode),
-                batch_size=args.batch_size,
-                compression=args.compress,
-                include_schema=not args.no_schema,
-                include_indexes=not args.no_indexes,
-                include_constraints=not args.no_constraints,
-                disable_foreign_keys=not args.keep_foreign_keys,
-                continue_on_error=args.continue_on_error
-            )
+            # Perform export
+            service.export()
             
-            # Create import service
-            import_service = ImportService(database, storage)
-            
-            # Get tables to import
-            tables = args.tables or [
-                f.stem for f in args.input.glob("*.sql")
-                if not f.stem.endswith(".schema")
-            ]
-            
-            # Import tables
-            results = import_service.import_tables(
-                tables,
-                args.input,
-                import_options
-            )
-            
-            # Print summary
-            logger.info("Import completed successfully:")
-            for result in results:
-                status_msg = f"Table {result.table_name}: {result.total_rows} rows"
-                if result.status == "skipped":
-                    logger.warning(f"{status_msg} (Skipped)")
-                elif result.status == "error":
-                    logger.error(f"{status_msg} (Error: {result.error_message})")
-                else:
-                    logger.info(f"{status_msg} (Imported)")
-        
-        else:
-            logger.error(f"Unknown operation mode: {args.mode}")
-            return 1
-    
     except ConfigError as e:
         logger.error(f"Configuration error: {str(e)}")
-        return 1
+        sys.exit(1)
     except ExportError as e:
         logger.error(f"Export error: {str(e)}")
-        return 1
-    except ImportError as e:
-        logger.error(f"Import error: {str(e)}")
-        return 1
+        sys.exit(1)
     except Exception as e:
         logger.error(f"Unexpected error: {str(e)}")
-        return 1
-    
-    return 0
+        sys.exit(1)
 
 if __name__ == "__main__":
-    exit(main()) 
+    main()

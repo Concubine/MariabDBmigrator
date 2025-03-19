@@ -1,4 +1,4 @@
-"""Domain models."""
+"""Domain models for the MariaDB export tool."""
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -12,6 +12,8 @@ class DatabaseConfig:
     user: str
     password: str
     database: str
+    use_pure: bool = True
+    auth_plugin: Optional[str] = None
 
 class ImportMode(Enum):
     """Import mode for handling existing tables."""
@@ -45,38 +47,40 @@ class ColumnMetadata:
 
 @dataclass
 class ExportOptions:
-    """Export options."""
+    """Options for exporting data."""
     batch_size: int = 1000
     where_clause: Optional[str] = None
     include_schema: bool = True
     include_indexes: bool = True
     include_constraints: bool = True
     compression: bool = False
+    parallel_workers: int = 4
 
 @dataclass
 class ImportOptions:
-    """Import options."""
-    mode: ImportMode = ImportMode.SKIP  # How to handle existing tables
+    """Options for importing data."""
+    mode: ImportMode = ImportMode.SKIP
     batch_size: int = 1000
     compression: bool = False
-    include_schema: bool = True  # Whether to import schema files
-    include_indexes: bool = True  # Whether to import indexes
-    include_constraints: bool = True  # Whether to import constraints
-    disable_foreign_keys: bool = True  # Whether to disable foreign keys during import
-    continue_on_error: bool = False  # Whether to continue if an error occurs
+    include_schema: bool = True
+    include_indexes: bool = True
+    include_constraints: bool = True
+    disable_foreign_keys: bool = True
+    continue_on_error: bool = False
+    parallel_workers: int = 4
 
 @dataclass
 class ExportResult:
-    """Export result."""
+    """Result of an export operation."""
     table_name: str
     total_rows: int
-    data_file: Path
     schema_file: Optional[Path] = None
+    data_file: Optional[Path] = None
 
 @dataclass
 class ImportResult:
-    """Import result."""
+    """Result of an import operation."""
     table_name: str
-    total_rows: int
-    status: str  # 'imported', 'skipped', 'error'
+    status: str
+    total_rows: int = 0
     error_message: Optional[str] = None 

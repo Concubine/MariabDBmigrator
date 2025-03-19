@@ -1,3 +1,4 @@
 mysql-connector-python>=8.0.0
 PyYAML>=6.0.0
-pyinstaller>=6.0.0 
+pyinstaller>=6.0.0
+sqlparse>=0.4.4 

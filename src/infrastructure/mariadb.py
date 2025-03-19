@@ -3,6 +3,7 @@ import mysql.connector
 from mysql.connector import Error
 from typing import List, Dict, Any, Optional, Iterator
 import logging
+from datetime import datetime, date
 
 from ..core.exceptions import DatabaseError
 from ..domain.interfaces import DatabaseInterface
@@ -20,7 +21,8 @@ class MariaDB(DatabaseInterface):
             'port': config.port,
             'user': config.user,
             'password': config.password,
-            'database': config.database
+            'database': config.database,
+            'use_pure': getattr(config, 'use_pure', True)
         }
         self._connection = None
         self._cursor = None
@@ -28,9 +30,10 @@ class MariaDB(DatabaseInterface):
     def connect(self) -> None:
         """Connect to the MariaDB database."""
         try:
-            self._connection = mysql.connector.connect(**self.config)
-            self._cursor = self._connection.cursor(dictionary=True)
-            logger.info("Connected to MariaDB database")
+            if not self._connection or not self._connection.is_connected():
+                self._connection = mysql.connector.connect(**self.config)
+                self._cursor = self._connection.cursor(dictionary=True)
+                logger.info("Connected to MariaDB database")
         except Error as e:
             raise DatabaseError(f"Failed to connect to database: {str(e)}")
     
@@ -263,6 +266,21 @@ class MariaDB(DatabaseInterface):
         except Error as e:
             self._connection.rollback()
             raise DatabaseError(f"Failed to execute batch: {str(e)}")
+    
+    def _format_value(self, value: Any) -> str:
+        """Format a value for SQL insertion."""
+        if value is None:
+            return 'NULL'
+        elif isinstance(value, (int, float)):
+            return str(value)
+        elif isinstance(value, (datetime, date)):
+            return f"'{value.isoformat()}'"
+        elif isinstance(value, bool):
+            return '1' if value else '0'
+        else:
+            # Escape single quotes and backslashes
+            escaped = str(value).replace("'", "''").replace("\\", "\\\\")
+            return f"'{escaped}'"
     
     def __enter__(self):
         """Context manager entry."""

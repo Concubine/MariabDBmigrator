@@ -24,10 +24,10 @@ def get_pip_path(venv_path: Path) -> str:
         return str(venv_path / "Scripts" / "pip.exe")
     return str(venv_path / "bin" / "pip")
 
-def upgrade_pip(pip_path: str) -> None:
+def upgrade_pip(python_path: str) -> None:
     """Upgrade pip to the latest version."""
     print("Upgrading pip...")
-    subprocess.run([pip_path, "install", "--upgrade", "pip"], check=True)
+    subprocess.run([python_path, "-m", "pip", "install", "--upgrade", "pip"], check=True)
 
 def install_requirements(pip_path: str, requirements_path: Path) -> None:
     """Install requirements from requirements.txt."""
@@ -42,17 +42,48 @@ def install_pyinstaller(pip_path: str) -> None:
 def build_executable(python_path: str, main_script: Path) -> None:
     """Build the executable using PyInstaller."""
     print("Building executable...")
-    subprocess.run([
+    # Set the working directory to the root directory
+    root_dir = Path(__file__).parent
+    # Use a spec file approach for more reliable imports
+    cmd = [
         python_path,
         "-m",
         "PyInstaller",
         "--onefile",
         "--name",
         "mariadbexport",
+        # Instead of adding as data, include as modules
         "--add-data",
         f"config{os.pathsep}config",
+        # Add the root directory to Python path to help with imports
+        "--paths",
+        str(root_dir),
+        # Key imports
+        "--hidden-import",
+        "src",
+        "--hidden-import",
+        "src.core.config",
+        "--hidden-import",
+        "src.core.exceptions",
+        "--hidden-import",
+        "src.domain.models",
+        "--hidden-import",
+        "src.infrastructure.mariadb",
+        "--hidden-import",
+        "src.infrastructure.storage",
+        "--hidden-import",
+        "src.services.export",
+        "--hidden-import",
+        "src.services.import_",
+        "--hidden-import",
+        "yaml",
+        "--hidden-import",
+        "mysql.connector",
+        "--hidden-import",
+        "sqlparse",
         str(main_script)
-    ], check=True)
+    ]
+    subprocess.run(cmd, check=True)
 
 def copy_config(config_path: Path, dist_path: Path) -> None:
     """Copy the config file to the dist folder."""
@@ -78,7 +109,7 @@ def main() -> None:
         pip_path = get_pip_path(venv_path)
         
         # Upgrade pip
-        upgrade_pip(pip_path)
+        upgrade_pip(python_path)
         
         # Install requirements
         install_requirements(pip_path, requirements_path)

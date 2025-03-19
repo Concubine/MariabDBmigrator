@@ -5,10 +5,26 @@ database:
   user: root
   password: rootpassword
   database: testdb
+  use_pure: true
 
 # Export configuration
 export:
   output_dir: exports
   batch_size: 1000
   compression: false
-  format: csv 
+  parallel_workers: $MAX_CPU_THREADS/2  # Use half of available CPU threads
+
+# Import configuration
+import:
+  batch_size: 1000
+  compression: false
+  parallel_workers: $MAX_CPU_THREADS/2  # Use half of available CPU threads
+
+# Logging configuration
+logging:
+  # Verbosity level: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  level: INFO
+  # Log file path (leave empty for console output only)
+  file: ""
+  # Log format (default is standard logging format)
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s" 
