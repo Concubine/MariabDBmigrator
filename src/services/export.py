@@ -17,6 +17,7 @@ from src.infrastructure.parallel import ParallelWorker, WorkerConfig
 from src.domain.interfaces import DatabaseInterface
 from src.ui.progress import ProgressTracker, ProgressStats
 from .validation import MetadataValidator
+from src.infrastructure.checksum import calculate_table_checksum, save_checksum
 
 # SUGGESTION: Add support for different output formats (CSV, JSON, Parquet)
 # SUGGESTION: Implement data checksums for validation during import
@@ -122,7 +123,7 @@ class ExportService:
                         estimated_total = (elapsed / ((i-1) * progress_factor)) * db_count
                         remaining = estimated_total - elapsed
                         logger.info(f"Progress: {i-1}/{db_count} databases completed. TOTAL databases in queue: {db_count}. Estimated time remaining: {self._format_time(remaining)}")
-                        print(f"Progress: {((i-1)/db_count)*100:.1f}% of databases. Est. remaining: {self._format_time(remaining)}")
+                        print(f"Progress: {(i-1)/db_count*100:.1f}% of databases. Est. remaining: {self._format_time(remaining)}")
                     
                     # Get tables to export for this database
                     db_results = self._export_database_tables()
@@ -224,19 +225,35 @@ class ExportService:
             
             # Export table schema
             schema_path = None
+            schema_exported = False
             if not self.config.exclude_schema:
                 schema_path = self._export_table_schema(table_name, table_output_dir)
+                schema_exported = True
             
             # Export table data if not in exclude_data list
             data_path = None
             rows_exported = 0
             file_size = 0
+            checksum = None
+            data_exported = False
             
             if table_name not in self.config.exclude_data:
                 data_path, rows_exported, file_size = self._export_table_data(
                     table_name, 
                     table_output_dir
                 )
+                data_exported = True
+                
+                # Get the checksum from the JSON file
+                checksum_path = table_output_dir / f"{table_name}_checksum.json"
+                if checksum_path.exists():
+                    try:
+                        with open(checksum_path, 'r') as f:
+                            import json
+                            checksum_data = json.load(f)
+                            checksum = checksum_data.get('checksum')
+                    except Exception as e:
+                        logger.warning(f"Failed to read checksum from {checksum_path}: {str(e)}")
             
             # Update total exported rows
             self.total_exported += rows_exported
@@ -249,47 +266,34 @@ class ExportService:
                 table_name=table_name,
                 success=True,
                 rows_exported=rows_exported,
-                total_rows=rows_exported,  # For backward compatibility
+                schema_exported=schema_exported,
+                data_exported=data_exported,
                 file_path=str(data_path) if data_path else None,
                 file_size=file_size,
                 duration=elapsed_time,
-                schema_file=schema_path,
-                data_file=data_path
+                checksum=checksum
             )
             
             # Log result
             logger.info(
-                f"Exported {table_name}: {rows_exported} rows, "
-                f"size: {self._format_size(file_size)}, "
-                f"time: {self._format_time(elapsed_time)}"
+                f"Exported table {table_name}: {rows_exported} rows "
+                f"in {elapsed_time:.2f} seconds ({self._format_size(file_size)})"
             )
-            
-            # Print to console too
-            print(f"✓ {table_name}: {rows_exported} rows, {self._format_size(file_size)}, {self._format_time(elapsed_time)}")
-            
-            # Update UI if available
-            if self.ui and hasattr(self.ui, 'display_export_result'):
-                self.ui.display_export_result(result)
             
             return result
             
         except Exception as e:
-            logger.error(f"Error exporting table {table_name}: {str(e)}")
-            print(f"✗ Error exporting {table_name}: {str(e)}")
-            
-            # Create failure result
-            result = ExportResult(
+            # Create error result
+            error_result = ExportResult(
                 table_name=table_name,
                 success=False,
-                error_message=str(e),
-                duration=time.time() - start_time
+                error_message=str(e)
             )
             
-            # Update UI if available
-            if self.ui and hasattr(self.ui, 'display_export_result'):
-                self.ui.display_export_result(result)
+            # Log error
+            logger.error(f"Failed to export table {table_name}: {str(e)}")
             
-            return result
+            return error_result
 
     def _export_table_data(self, table_name: str, output_dir: Path) -> tuple:
         """Export table data to a file.
@@ -299,125 +303,123 @@ class ExportService:
             output_dir: Output directory
             
         Returns:
-            Tuple of (path, rows_exported, file_size)
+            Tuple containing file path, rows exported, and file size
             
         Raises:
             ExportError: If export fails
         """
-        # SUGGESTION: Implement option to split large tables into multiple files
-        logger.info(f"Exporting data for table: {table_name}")
-        
-        # Get row count for progress tracking
-        row_count = self.db.get_row_count(table_name, self.config.where)
-        logger.info(f"Table {table_name} has {row_count} rows to export")
-        print(f"Table {table_name} has {row_count} rows to export")
-        
-        # Create data file path
-        file_path = output_dir / f"{table_name}_data.sql"
-        
-        # Create progress tracker
-        tracker = None
-        if self.ui and hasattr(self.ui, 'display_progress'):
-            tracker = ProgressTracker(
-                total_items=max(1, row_count),  # Ensure at least 1 item to avoid division by zero
-                update_callback=self.ui.display_progress,
-                update_interval=0.5  # Update more frequently for better visual feedback
-            )
+        try:
+            # Create output file path
+            file_path = output_dir / f"{table_name}_data.sql"
+            logger.info(f"Exporting data to {file_path}")
             
-            # Initialize progress at 0
-            tracker.update(0)
-        
-        # Export data
-        rows_exported = 0
-        with open(file_path, 'w', encoding='utf-8') as f:
-            # Write header
-            database = self.db.config.get('database', '')
-            f.write(f"-- MariaDB Export Tool - Data export for table: {table_name}\n")
-            f.write(f"-- Database: {database}\n")
-            f.write(f"-- Exported: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"-- Rows: {row_count}\n\n")
+            # Get row count for progress tracking - use execute_query to handle result sets properly
+            count_query = f"SELECT COUNT(*) as total FROM `{table_name}`"
+            count_result = self.db.execute_query(count_query)
+            total_rows = count_result[0]['total'] if count_result else 0
+            logger.info(f"Table {table_name} has {total_rows} rows")
             
-            # Disable keys and unique checks for faster import
-            f.write("SET FOREIGN_KEY_CHECKS=0;\n")
-            f.write("SET UNIQUE_CHECKS=0;\n\n")
-            
-            # Get data in batches
-            f.write(f"-- Data for table {table_name}\n")
-            f.write(f"INSERT INTO `{table_name}` VALUES\n")
-            
-            first_batch = True
-            
-            # Get data in batches
-            for batch_index, batch in enumerate(self.db.get_table_data(
-                table_name, 
-                self.config.batch_size, 
-                self.config.where
-            )):
-                if not batch:
-                    continue
-                    
-                # Write comma between batches except for the first one
-                if not first_batch:
-                    f.write(",\n")
-                first_batch = False
+            # Create progress tracker
+            tracker = None
+            if self.ui and hasattr(self.ui, 'display_progress'):
+                # Create a progress tracker with the total number of rows
+                tracker = ProgressTracker(
+                    total_items=total_rows,
+                    update_callback=self.ui.display_progress
+                )
                 
-                # Write batch data
-                for i, row in enumerate(batch):
-                    if i > 0:
-                        f.write(",\n")
+                # Initial update with 0 processed items
+                tracker.update(0)
+            
+            # Export data in batches
+            batch_size = self.config.batch_size
+            offset = 0
+            total_exported = 0
+            all_rows = []  # Store all rows for checksum calculation
+            
+            current_time = time.time()
+            
+            while True:
+                # Build query with WHERE clause if specified
+                query = f"SELECT * FROM `{table_name}`"
+                if hasattr(self.config, 'where') and self.config.where:
+                    query += f" WHERE {self.config.where}"
                     
-                    # Format row values according to their types
-                    values = []
-                    for value in row.values():
-                        if value is None:
-                            values.append("NULL")
-                        elif isinstance(value, (int, float)):
-                            values.append(str(value))
-                        elif isinstance(value, (bytes, bytearray)):
-                            # Handle binary data
-                            hex_value = value.hex()
-                            values.append(f"0x{hex_value}")
-                        else:
-                            # Escape string values
-                            escaped = str(value).replace("'", "''")
-                            values.append(f"'{escaped}'")
+                # Add LIMIT clause
+                query += f" LIMIT {offset}, {batch_size}"
+                
+                # Execute query - use execute_query instead of execute
+                rows = self.db.execute_query(query)
+                if not rows:
+                    break
+                
+                # Store rows for checksum calculation
+                all_rows.extend(rows)
+                
+                # Append to file
+                if offset == 0:
+                    # First batch - create new file
+                    self.storage.save_data(rows, file_path)
+                else:
+                    # Subsequent batches - append to file
+                    sql_data = self._convert_to_sql(rows, table_name)
+                    self.storage.write_data(file_path, sql_data, append=True)
                     
-                    # Write row values
-                    f.write(f"({', '.join(values)})")
+                # Update counters
+                batch_count = len(rows)
+                total_exported += batch_count
+                offset += batch_count
                 
                 # Update progress
-                rows_exported += len(batch)
                 if tracker:
-                    # Print progress to console as well for stdout tracking
-                    percent = (rows_exported / max(1, row_count)) * 100
-                    if percent % 10 < 2 or percent > 98:  # Log at 0%, 10%, 20%... and > 98%
-                        logger.info(f"Progress: {percent:.1f}% of {row_count} rows for {table_name}")
-                        
-                        # Print progress bar to stdout
-                        bar_width = 40
-                        filled_width = int(bar_width * percent / 100)
-                        bar = '=' * filled_width + '-' * (bar_width - filled_width)
-                        print(f"[{bar}] {percent:.1f}% ({rows_exported}/{row_count})", end='\r')
-                        sys.stdout.flush()
-                        
-                    tracker.update(rows_exported)
+                    tracker.update(total_exported)
+                    
+                # Break if batch is smaller than batch size (last batch)
+                if batch_count < batch_size:
+                    break
             
-            # Finalize SQL
-            f.write(";\n\n")
-            f.write("SET FOREIGN_KEY_CHECKS=1;\n")
-            f.write("SET UNIQUE_CHECKS=1;\n")
+            # Calculate table checksum and save it
+            if all_rows:
+                checksum = calculate_table_checksum(all_rows)
+                checksum_path = str(output_dir / f"{table_name}_checksum.json")
+                database_name = self.db.config.get('database', 'default')
+                save_checksum(checksum, table_name, database_name, checksum_path)
+                logger.info(f"Saved checksum for table {table_name} to {checksum_path}")
+                
+            # Complete progress
+            if tracker:
+                tracker.complete()
+                
+            # Get file size
+            file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+            
+            return file_path, total_exported, file_size
+        except Exception as e:
+            raise ExportError(f"Failed to export data for table {table_name}: {str(e)}")
         
-        # Get file size
-        file_size = os.path.getsize(file_path)
+    def _convert_to_sql(self, data: List[Dict[str, Any]], table_name: str) -> str:
+        """Convert data to SQL INSERT statements."""
+        sql_statements = []
+        for row in data:
+            # Convert values to SQL format
+            values = []
+            for value in row.values():
+                if value is None:
+                    values.append('NULL')
+                elif isinstance(value, (int, float)):
+                    values.append(str(value))
+                else:
+                    # Escape single quotes and wrap in quotes
+                    value_str = str(value).replace("'", "''")
+                    values.append(f"'{value_str}'")
+            
+            # Create INSERT statement
+            columns = ', '.join(f"`{col}`" for col in row.keys())
+            values_str = ', '.join(values)
+            sql = f"INSERT INTO `{table_name}` ({columns}) VALUES ({values_str});"
+            sql_statements.append(sql)
         
-        # Complete progress
-        if tracker:
-            tracker.complete()
-        
-        # End progress line
-        print()  # Move to next line after progress updates
-        
-        return file_path, rows_exported, file_size
+        return '\n'.join(sql_statements)
 
     def _export_table_schema(self, table_name: str, output_dir: Path) -> Path:
         """Export table schema to a file.

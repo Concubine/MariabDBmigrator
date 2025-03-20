@@ -8,7 +8,7 @@ from typing import Optional
 import logging
 
 from src.core.config import load_config
-from src.core.logging import setup_logging, log_config
+from src.core.logging import setup_logging, log_config, LoggingConfig
 from src.services.export import ExportService
 from src.services.import_ import ImportService
 from src.domain.models import ImportMode
@@ -111,6 +111,8 @@ def parse_args() -> argparse.Namespace:
     export_parser.add_argument("--exclude-data", nargs="+", help="Tables to export without data")
     export_parser.add_argument("--information-schema", action="store_true", help="Export information_schema database")
     export_parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
+    export_parser.add_argument("--ui", choices=["ascii", "rich_ascii"], default="rich_ascii", 
+                               help="UI interface to use (default: rich_ascii)")
     # SUGGESTION: Add --dry-run option to show what would be exported without actually exporting
     # SUGGESTION: Add --format option to support different export formats (SQL, CSV, JSON, etc.)
     
@@ -131,6 +133,8 @@ def parse_args() -> argparse.Namespace:
     import_parser.add_argument("--import-schema", action="store_true", help="Import table schema")
     import_parser.add_argument("--import-data", action="store_true", help="Import table data")
     import_parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
+    import_parser.add_argument("--ui", choices=["ascii", "rich_ascii"], default="rich_ascii", 
+                               help="UI interface to use (default: rich_ascii)")
     # SUGGESTION: Add --dry-run option to parse and validate SQL without executing
     # SUGGESTION: Add progress bar option with rich or tqdm libraries
     
@@ -168,7 +172,24 @@ def main() -> int:
         # Setup logging
         verbose = getattr(args, 'verbose', False)
         log_level = logging.DEBUG if verbose else logging.INFO
-        setup_logging(log_level)
+        
+        # Get UI type if specified
+        ui_type = getattr(args, 'ui', None)
+        
+        # Create basic logging config
+        if ui_type:
+            # If UI type is specified, pass it to logging setup
+            logging_config_obj = LoggingConfig(
+                level=log_level,
+                file=f"logs/MariaDB_Export_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
+                format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            )
+            # Add UI type info
+            setattr(logging_config_obj, 'ui_type', ui_type)
+            setup_logging(logging_config_obj)
+        else:
+            # Simple setup with just log level
+            setup_logging(log_level)
         
         # Load configuration
         config_path = args.config
@@ -210,8 +231,9 @@ def main() -> int:
             # Export data
             global export_service
             
-            # Create export service with ASCII interface
-            ui_interface = create_interface()
+            # Create export service with selected interface
+            ui_type = args.ui if hasattr(args, 'ui') else config.ui.type
+            ui_interface = create_interface(ui_type, config.ui)
             export_service = ExportService(config.database, config.export, ui_interface)
             
             # Export data
@@ -266,8 +288,9 @@ def main() -> int:
             # Import data
             global import_service
             
-            # Create import service with ASCII interface
-            ui_interface = create_interface()
+            # Create import service with selected interface
+            ui_type = args.ui if hasattr(args, 'ui') else config.ui.type
+            ui_interface = create_interface(ui_type, config.ui)
             import_service = ImportService(config.database, import_files, config.import_, ui_interface)
             
             # Import data

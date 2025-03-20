@@ -78,26 +78,77 @@ class ImportOptions:
 
 @dataclass
 class ExportResult:
-    """Result of an export operation."""
-    table_name: str
-    success: bool = True
-    rows_exported: int = 0
-    file_path: Optional[str] = None
-    file_size: int = 0
-    duration: float = 0.0
-    error_message: Optional[str] = None
-    schema_file: Optional[Path] = None
-    data_file: Optional[Path] = None
-    total_rows: int = 0  # For backward compatibility
+    """Export result for a table."""
+    
+    def __init__(
+        self,
+        table_name: str,
+        success: bool = False,
+        rows_exported: int = 0,
+        schema_exported: bool = False,
+        data_exported: bool = False,
+        file_path: Optional[str] = None,
+        file_size: int = 0,
+        duration: float = 0.0,
+        error_message: Optional[str] = None,
+        checksum: Optional[str] = None
+    ):
+        """Initialize export result."""
+        self.table_name = table_name
+        self.success = success
+        self.rows_exported = rows_exported
+        self.schema_exported = schema_exported
+        self.data_exported = data_exported
+        self.file_path = file_path
+        self.file_size = file_size
+        self.duration = duration
+        self.error_message = error_message
+        self.checksum = checksum
 
 @dataclass
 class ImportResult:
-    """Result of an import operation."""
-    table_name: str
-    status: str
-    success: bool = True
-    rows_imported: int = 0
-    total_rows: int = 0  # For backward compatibility
-    file_path: Optional[str] = None
-    duration: float = 0.0
-    error_message: Optional[str] = None 
+    """Import result for a file."""
+    
+    def __init__(
+        self,
+        table_name: str,
+        status: str = "pending",
+        rows_imported: int = 0,
+        duration: float = 0.0,
+        error_message: Optional[str] = None,
+        database: Optional[str] = None,
+        checksum_verified: bool = False,
+        checksum_status: Optional[str] = None
+    ):
+        """Initialize import result."""
+        self.table_name = table_name
+        self.status = status
+        self.rows_imported = rows_imported
+        self.duration = duration
+        self.error_message = error_message
+        self.database = database
+        self.checksum_verified = checksum_verified
+        self.checksum_status = checksum_status
+
+class ChecksumData:
+    """Checksum data for data integrity verification."""
+    
+    def __init__(
+        self,
+        database: str,
+        table: str,
+        checksum: str,
+        version: str = "1.0"
+    ):
+        """Initialize checksum data.
+        
+        Args:
+            database: Database name
+            table: Table name
+            checksum: Checksum value
+            version: Checksum format version
+        """
+        self.database = database
+        self.table = table
+        self.checksum = checksum
+        self.version = version 

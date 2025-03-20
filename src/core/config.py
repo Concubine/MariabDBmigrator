@@ -126,12 +126,23 @@ class LoggingConfig:
     # SUGGESTION: Add option for JSON formatted logs for better machine parsing
 
 @dataclass
+class UIConfig:
+    """UI configuration."""
+    type: str = "rich_ascii"  # Options: ascii, rich_ascii
+    theme: str = "default"    # For future theme support
+    show_summary: bool = True  # Show summary tables
+    show_detailed_results: bool = True  # Show detailed result tables
+    show_progress: bool = True  # Show progress indicators
+    show_logs: bool = True  # Show logs in the dashboard
+
+@dataclass
 class Config:
     """Main configuration class."""
     database: DatabaseConfig
     export: ExportConfig
     import_: ImportConfig
     logging: LoggingConfig
+    ui: UIConfig = field(default_factory=lambda: UIConfig())
     # SUGGESTION: Add option for performance monitoring/telemetry
     # SUGGESTION: Add plugin configuration for extensibility
 
@@ -241,11 +252,23 @@ def load_config(config_file: Optional[Path] = None) -> Config:
         format=logging_config.get('format', '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     )
     
+    # Load UI config
+    ui_config = config_dict.get('ui', {})
+    ui = UIConfig(
+        type=ui_config.get('type', 'rich_ascii'),
+        theme=ui_config.get('theme', 'default'),
+        show_summary=ui_config.get('show_summary', True),
+        show_detailed_results=ui_config.get('show_detailed_results', True),
+        show_progress=ui_config.get('show_progress', True),
+        show_logs=ui_config.get('show_logs', True)
+    )
+    
     return Config(
         database=database,
         export=export,
         import_=import_,
-        logging=logging
+        logging=logging,
+        ui=ui
     )
 
 def _find_config_file() -> Optional[Path]:
@@ -306,7 +329,8 @@ def _config_to_dict(config: Config) -> Dict[str, Any]:
         'database': asdict(config.database),
         'export': asdict(config.export),
         'import': asdict(config.import_),
-        'logging': asdict(config.logging)
+        'logging': asdict(config.logging),
+        'ui': asdict(config.ui)
     }
     
     # Remove None values for cleaner output

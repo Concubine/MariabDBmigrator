@@ -939,16 +939,31 @@ class MariaDB(DatabaseInterface):
         except Error as e:
             raise DatabaseError(f"Failed to get data from table {table_name}: {str(e)}")
     
-    def execute(self, query: str) -> None:
+    def execute(self, query: str) -> List[Any]:
         """Execute a SQL statement.
         
         Args:
             query: SQL statement to execute
+            
+        Returns:
+            Results of the query if any, or empty list
+            
+        Raises:
+            DatabaseError: If an error occurs during execution
         """
         try:
             self._ensure_connected()
             self._cursor.execute(query)
+            
+            # Always try to fetch all results to avoid "Unread result found" errors
+            try:
+                results = self._cursor.fetchall()
+            except Exception:
+                # No results or already consumed
+                results = []
+            
             self._connection.commit()
+            return results
         except Error as e:
             raise DatabaseError(f"Failed to execute query: {str(e)}")
 

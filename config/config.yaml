@@ -48,3 +48,16 @@ logging:
   file: "LoggerOutput.log"
   # Log format (default is standard logging format)
   format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s" 
+
+# UI configuration
+ui:
+  # UI type: ascii (basic), rich_ascii (enhanced)
+  type: rich_ascii
+  # Theme for the UI (for future use)
+  theme: default
+  # Display options
+  show_summary: true
+  show_detailed_results: true
+  show_progress: true
+  # Show live logs in the dashboard
+  show_logs: true 

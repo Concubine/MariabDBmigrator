@@ -14,6 +14,7 @@ A high-performance parallel tool for exporting and importing MariaDB databases.
 - Configurable export/import modes
 - Verbose logging options
 - Enhanced visualization with Rich terminal interface
+- Data integrity verification with checksums
 
 ## Requirements
 - Python 3.12+
@@ -49,6 +50,19 @@ To select the visualization mode, use the `--ui` parameter:
 mariadbexport.exe export --ui rich_ascii [options]  # Enhanced visualization (default)
 mariadbexport.exe export --ui ascii [options]       # Basic ASCII visualization
 ```
+
+## Data Integrity with Checksums
+
+The MariaDB Export/Import Tool now includes built-in data integrity verification through checksums:
+
+- During export, a SHA-256 checksum is calculated for each table's data
+- Checksums are stored alongside the exported data in JSON files
+- During import, data integrity is automatically verified against the stored checksums
+- Import behavior on checksum mismatch depends on the selected import mode:
+  - In `cancel` mode, the import will abort if a checksum mismatch is detected
+  - In other modes, a warning is logged and the import continues
+  
+This feature ensures database consistency by guaranteeing that the data hasn't been corrupted or tampered with between export and import operations.
 
 ## Usage
 

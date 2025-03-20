@@ -53,10 +53,16 @@ def setup_logging(config) -> None:
         
         simple_formatter = logging.Formatter(log_format)
         
-        # Console handler with simple format
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setFormatter(simple_formatter)
-        handlers.append(console_handler)
+        # Check for UI type to determine if we should log to console
+        ui_type = getattr(config, 'ui_type', None)
+        
+        # Only add console handler if not using rich_ascii UI
+        # or if explicitly requested
+        if ui_type != 'rich_ascii' or getattr(config, 'console_logs', True):
+            # Console handler with simple format
+            console_handler = logging.StreamHandler(sys.stdout)
+            console_handler.setFormatter(simple_formatter)
+            handlers.append(console_handler)
         
         # File handler with detailed format if file path is specified
         if log_file:

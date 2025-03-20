@@ -15,6 +15,7 @@ from src.infrastructure.mariadb import MariaDB
 from src.infrastructure.storage import SQLStorage
 from src.infrastructure.parallel import ParallelWorker, WorkerConfig
 from src.ui.progress import ProgressTracker, ProgressStats
+from src.infrastructure.checksum import calculate_table_checksum, load_checksum, verify_checksum
 
 # SUGGESTION: Add support for different input formats (CSV, JSON, Parquet)
 # SUGGESTION: Implement data validation with checksums during import
@@ -222,8 +223,36 @@ class ImportService:
             
             # For consolidated schema/data files, extract database name
             file_name = file_path.stem
+            
+            # Extract table name from filename
+            table_name = None
+            if file_name.endswith('_data'):
+                table_name = file_name.replace('_data', '')
+                
+                # Check if a checksum file exists for this table
+                checksum_file = file_path.parent / f"{table_name}_checksum.json"
+                if checksum_file.exists():
+                    logger.info(f"Found checksum file for {table_name}: {checksum_file}")
+                    
+                    # We'll verify the checksum during actual data loading
+                    verify_integrity = True
+                else:
+                    logger.warning(f"No checksum file found for {table_name}")
+                    verify_integrity = False
+            else:
+                verify_integrity = False
+            
+            # Determine if this is a schema or data file
+            is_schema_file = "_schema" in file_path.name
+            is_data_file = "_data" in file_path.name
+
             if file_name.endswith('_schema') or file_name.endswith('_data'):
                 database_name = file_name.replace('_schema', '').replace('_data', '')
+                
+                # For data files, get table name
+                if is_data_file and not table_name:
+                    table_name = database_name
+                
                 logger.info(f"Processing {file_name} for database {database_name}")
                 
                 # Make sure we're using the right database
@@ -260,29 +289,29 @@ class ImportService:
                         else:
                             # Use the filename as table name
                             table_name = filename
+            
+            logger.info(f"Identified table name '{table_name}' for file {file_path.name}")
+            
+            # Handle database name if found
+            if 'db_name' in locals() and db_name and db_name != self.database.database:
+                logger.info(f"SQL file contains a different database name ({db_name}) than the configured one ({self.database.database})")
                 
-                logger.info(f"Identified table name '{table_name}' for file {file_path.name}")
-                
-                # Handle database name if found
-                if 'db_name' in locals() and db_name and db_name != self.database.database:
-                    logger.info(f"SQL file contains a different database name ({db_name}) than the configured one ({self.database.database})")
-                    
-                    # If no database was specified in configuration or import options, use the one from the file
-                    if not self.config.database and (not self.database.database or self.database.database == "imported_db"):
-                        logger.info(f"Using original database name from SQL file: {db_name}")
-                        self.database.database = db_name
-                        # Make sure the database exists
-                        self.db.execute(f"CREATE DATABASE IF NOT EXISTS `{self.database.database}`")
-                        # Select the database
-                        self.db.select_database(self.database.database)
-                    # Otherwise replace database name in SQL content with the configured one
-                    else:
-                        # Replace database name in SQL content if needed
-                        sql_content = re.sub(
-                            r'(`?' + re.escape(db_name) + r'`?\.)',
-                            f'`{self.database.database}`.',
-                            sql_content
-                        )
+                # If no database was specified in configuration or import options, use the one from the file
+                if not self.config.database and (not self.database.database or self.database.database == "imported_db"):
+                    logger.info(f"Using original database name from SQL file: {db_name}")
+                    self.database.database = db_name
+                    # Make sure the database exists
+                    self.db.execute(f"CREATE DATABASE IF NOT EXISTS `{self.database.database}`")
+                    # Select the database
+                    self.db.select_database(self.database.database)
+                # Otherwise replace database name in SQL content with the configured one
+                else:
+                    # Replace database name in SQL content if needed
+                    sql_content = re.sub(
+                        r'(`?' + re.escape(db_name) + r'`?\.)',
+                        f'`{self.database.database}`.',
+                        sql_content
+                    )
             
             # Check for any tables that might already exist in the target database
             if file_path.stem.endswith('_schema'):
@@ -514,6 +543,145 @@ class ImportService:
                             else:
                                 raise ImportError(f"Error executing data statement: {str(e)}")
             
+            # If this is a data file and we need to verify checksum
+            if is_data_file and verify_integrity:
+                try:
+                    # Load all rows from the file to calculate checksum
+                    all_rows = []
+                    
+                    # Parse SQL to extract INSERT statements and convert to rows
+                    statements = sqlparse.parse(sql_content)
+                    for statement in statements:
+                        if statement.get_type() == 'INSERT':
+                            # Extract table name and columns from INSERT statement
+                            tokens = statement.flatten()
+                            
+                            # Find columns section: INSERT INTO table (col1, col2) VALUES ...
+                            into_index = -1
+                            table_index = -1
+                            columns_start = -1
+                            columns_end = -1
+                            values_start = -1
+                            
+                            for i, token in enumerate(tokens):
+                                if token.ttype is sqlparse.tokens.Keyword and token.value.upper() == 'INTO':
+                                    into_index = i
+                                elif into_index > -1 and table_index == -1 and token.ttype is not sqlparse.tokens.Whitespace:
+                                    table_index = i
+                                elif token.value == '(' and columns_start == -1:
+                                    columns_start = i
+                                elif token.value == ')' and columns_start > -1 and columns_end == -1:
+                                    columns_end = i
+                                elif token.ttype is sqlparse.tokens.Keyword and token.value.upper() == 'VALUES' and values_start == -1:
+                                    values_start = i
+                            
+                            # Extract column names
+                            columns = []
+                            if columns_start > -1 and columns_end > -1:
+                                for token in tokens[columns_start+1:columns_end]:
+                                    if token.ttype is not sqlparse.tokens.Punctuation and token.ttype is not sqlparse.tokens.Whitespace:
+                                        columns.append(token.value.strip('`"\''))
+                            
+                            # Extract values sections
+                            if values_start > -1:
+                                for group_tokens in statement.get_sublists():
+                                    # Find value lists like (val1, val2)
+                                    if isinstance(group_tokens, sqlparse.sql.Parenthesis) and str(group_tokens).startswith('('):
+                                        # Extract individual values
+                                        values = []
+                                        current_val = ""
+                                        in_string = False
+                                        
+                                        for token in group_tokens.flatten():
+                                            if token.value == '(' or token.value == ')':
+                                                continue
+                                            elif token.value == ',' and not in_string:
+                                                values.append(current_val.strip())
+                                                current_val = ""
+                                            elif token.value.upper() == 'NULL':
+                                                current_val += "NULL"
+                                            elif token.ttype is sqlparse.tokens.String:
+                                                # Handle quoted strings
+                                                current_val += token.value
+                                            elif token.ttype is not sqlparse.tokens.Whitespace:
+                                                current_val += token.value
+                                                
+                                            # Track string delimiters
+                                            if token.ttype is sqlparse.tokens.String:
+                                                in_string = not in_string
+                                        
+                                        # Add the last value
+                                        if current_val:
+                                            values.append(current_val.strip())
+                                        
+                                        # Create a row dictionary with column names and values
+                                        if columns and len(columns) == len(values):
+                                            row_dict = {}
+                                            for col, val in zip(columns, values):
+                                                # Convert value types
+                                                if val.upper() == 'NULL':
+                                                    row_dict[col] = None
+                                                elif val.startswith("'") and val.endswith("'"):
+                                                    row_dict[col] = val[1:-1].replace("''", "'")
+                                                else:
+                                                    try:
+                                                        row_dict[col] = int(val)
+                                                    except ValueError:
+                                                        try:
+                                                            row_dict[col] = float(val)
+                                                        except ValueError:
+                                                            row_dict[col] = val
+                                        
+                                        all_rows.append(row_dict)
+                
+                    # Calculate checksum from parsed data
+                    if all_rows:
+                        calculated_checksum = calculate_table_checksum(all_rows)
+                        
+                        # Load expected checksum
+                        checksum_file = file_path.parent / f"{table_name}_checksum.json"
+                        expected_checksum = load_checksum(str(checksum_file))
+                        
+                        # Verify checksum
+                        if expected_checksum:
+                            if verify_checksum(calculated_checksum, expected_checksum):
+                                logger.info(f"Checksum verification passed for table {table_name}")
+                                checksum_verified = True
+                                checksum_status = "verified"
+                            else:
+                                error_msg = f"Checksum verification failed for table {table_name}. Data may be corrupted."
+                                logger.error(error_msg)
+                                checksum_verified = True
+                                checksum_status = "failed"
+                                
+                                # Handle checksum mismatch based on import mode
+                                if self.config.mode == ImportMode.CANCEL:
+                                    return ImportResult(
+                                        table_name=table_name,
+                                        status="error",
+                                        error_message=error_msg,
+                                        database=self.database.database,
+                                        checksum_verified=True,
+                                        checksum_status="failed"
+                                    )
+                                elif self.config.mode != ImportMode.OVERWRITE:
+                                    # For non-overwrite modes, warn and continue
+                                    logger.warning("Continuing import despite checksum mismatch due to import mode setting")
+                        else:
+                            logger.warning(f"Could not load expected checksum for verification: {checksum_file}")
+                            checksum_verified = False
+                            checksum_status = "missing"
+                    else:
+                        logger.warning(f"No rows parsed for checksum verification from {file_path}")
+                        checksum_verified = False
+                        checksum_status = "no_data"
+                    
+                except Exception as e:
+                    logger.error(f"Error during checksum verification: {str(e)}")
+                    checksum_verified = False
+                    checksum_status = "error"
+                    # Continue with import despite checksum verification error
+            
             # For consolidated files, use the database name as the table name in the result
             table_name = self.database.database
             if file_path.stem.endswith('_schema'):
@@ -522,11 +690,24 @@ class ImportService:
                 table_name = f"{file_path.stem.replace('_data', '')} (data)"
                 
             logger.info(f"Successfully imported file: {file_path.name}")
-            return ImportResult(
-                table_name=table_name,
-                status="success",
-                total_rows=total_rows
+            elapsed_time = time.time() - self.start_time
+            result = ImportResult(
+                table_name=table_name if table_name else file_path.stem,
+                status="success" if total_rows > 0 else "error",
+                rows_imported=total_rows,
+                duration=elapsed_time,
+                error_message=None,
+                database=self.database.database,
+                checksum_verified=checksum_verified if 'checksum_verified' in locals() else False,
+                checksum_status=checksum_status if 'checksum_status' in locals() else None
             )
+            
+            logger.info(
+                f"Import of {file_path.name} completed in {elapsed_time:.2f} seconds. "
+                f"Imported {total_rows} rows. Status: {result.status}"
+            )
+            
+            return result
             
         except Exception as e:
             logger.error(f"Error importing file {file_path}: {str(e)}", exc_info=True)
