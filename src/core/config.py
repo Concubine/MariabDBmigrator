@@ -2,12 +2,25 @@
 import os
 import sys
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Union
 import yaml
-from dataclasses import dataclass
+from dataclasses import dataclass, field, is_dataclass, asdict
+import logging
 
 from src.core.exceptions import ConfigError
 from src.infrastructure.parallel import parse_worker_count
+
+# SUGGESTION: Use environment variables with defaults for containerized deployments
+# SUGGESTION: Add support for config validation using JSON Schema or Pydantic
+# SUGGESTION: Implement configuration versioning for backward compatibility
+
+# Set up the default configuration locations
+DEFAULT_CONFIG_FILE = "config/config.yaml"
+DEFAULT_CONFIG_DIRS = [
+    ".",
+    "~/.mariadbexport",
+    "/etc/mariadbexport",
+]
 
 @dataclass
 class DatabaseConfig:
@@ -25,6 +38,8 @@ class DatabaseConfig:
     ssl_key: Optional[str] = None  # Already has default None
     ssl_verify_cert: bool = False  # Add default value
     ssl_verify_identity: bool = False  # Add default value
+    # SUGGESTION: Add connection timeout settings
+    # SUGGESTION: Add connection pool settings (pool_size, pool_timeout)
 
 @dataclass
 class ExportConfig:
@@ -59,6 +74,8 @@ class ExportConfig:
         self.exclude_tables = exclude_tables or []
         self.exclude_data = exclude_data or []
         self.include_information_schema = include_information_schema
+    # SUGGESTION: Add option for partition handling (export/import all or specific partitions)
+    # SUGGESTION: Add option for data transformation during export (filtering, anonymization)
 
 @dataclass
 class ImportConfig:
@@ -96,6 +113,8 @@ class ImportConfig:
         self.import_schema = import_schema
         self.import_data = import_data
         self.database = database
+    # SUGGESTION: Add option for data validation before import
+    # SUGGESTION: Add option for data transformation during import (mapping values)
 
 @dataclass
 class LoggingConfig:
@@ -103,6 +122,8 @@ class LoggingConfig:
     level: str
     file: str
     format: str
+    # SUGGESTION: Add log rotation settings (max_size, backup_count)
+    # SUGGESTION: Add option for JSON formatted logs for better machine parsing
 
 @dataclass
 class Config:
@@ -111,6 +132,8 @@ class Config:
     export: ExportConfig
     import_: ImportConfig
     logging: LoggingConfig
+    # SUGGESTION: Add option for performance monitoring/telemetry
+    # SUGGESTION: Add plugin configuration for extensibility
 
 def get_default_config_path() -> Path:
     """Get the default configuration file path.
@@ -135,11 +158,11 @@ def get_default_config_path() -> Path:
     base_dir = getattr(sys, '_MEIPASS', Path(__file__).parent.parent.parent)
     return Path(base_dir) / "config" / "config.yaml"
 
-def load_config(config_path: Optional[Path] = None) -> Config:
+def load_config(config_file: Optional[Path] = None) -> Config:
     """Load configuration from YAML file.
     
     Args:
-        config_path: Path to configuration file. If not provided, uses default path.
+        config_file: Path to configuration file. If not provided, uses default path.
         
     Returns:
         Config object with loaded settings
@@ -147,13 +170,14 @@ def load_config(config_path: Optional[Path] = None) -> Config:
     Raises:
         ConfigError: If configuration is invalid or missing required fields
     """
-    if config_path is None:
-        config_path = get_default_config_path()
+    # Try to find the configuration file
+    if config_file is None:
+        config_file = _find_config_file()
         
-    if not config_path.exists():
-        raise ConfigError(f"Configuration file not found: {config_path}")
+    if not config_file.exists():
+        raise ConfigError(f"Configuration file not found: {config_file}")
         
-    with open(config_path, 'r') as f:
+    with open(config_file, 'r') as f:
         config_dict = yaml.safe_load(f)
     
     # Load database config
@@ -223,3 +247,72 @@ def load_config(config_path: Optional[Path] = None) -> Config:
         import_=import_,
         logging=logging
     )
+
+def _find_config_file() -> Optional[Path]:
+    """Find the configuration file in the default locations.
+    
+    Returns:
+        Path to the configuration file, or None if not found
+    """
+    # First check if the default config file exists
+    if os.path.exists(DEFAULT_CONFIG_FILE):
+        return Path(DEFAULT_CONFIG_FILE)
+        
+    # Check the default directories
+    for directory in DEFAULT_CONFIG_DIRS:
+        expanded_dir = os.path.expanduser(directory)
+        config_path = os.path.join(expanded_dir, "config.yaml")
+        if os.path.exists(config_path):
+            return Path(config_path)
+            
+    return None
+
+def save_config(config: Config, file_path: Path) -> None:
+    """Save the configuration to a file.
+    
+    Args:
+        config: Configuration object
+        file_path: Path to the file
+        
+    Raises:
+        ConfigError: If the configuration cannot be saved
+    """
+    # SUGGESTION: Add option to save only non-default values for cleaner configs
+    try:
+        # Create the directory if it doesn't exist
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        
+        # Convert the config to a dictionary
+        config_dict = _config_to_dict(config)
+        
+        # Write the configuration to file
+        with open(file_path, 'w') as f:
+            yaml.dump(config_dict, f, default_flow_style=False)
+    except Exception as e:
+        raise ConfigError(f"Failed to save configuration: {str(e)}")
+        
+def _config_to_dict(config: Config) -> Dict[str, Any]:
+    """Convert a configuration object to a dictionary.
+    
+    Args:
+        config: Configuration object
+        
+    Returns:
+        Dictionary representation of the configuration
+    """
+    # SUGGESTION: Add support for serializing custom plugin configs
+    
+    result = {
+        'database': asdict(config.database),
+        'export': asdict(config.export),
+        'import': asdict(config.import_),
+        'logging': asdict(config.logging)
+    }
+    
+    # Remove None values for cleaner output
+    for section in result.values():
+        keys_to_remove = [k for k, v in section.items() if v is None]
+        for key in keys_to_remove:
+            del section[key]
+            
+    return result

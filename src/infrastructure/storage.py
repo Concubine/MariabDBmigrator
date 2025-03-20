@@ -1,10 +1,12 @@
 """File storage operations implementation."""
 import gzip
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Iterator
 import logging
 import sqlparse
 from sqlparse.sql import TokenList, Token
+import os
+import shutil
 
 from ..core.exceptions import StorageError
 from ..domain.interfaces import StorageInterface
@@ -25,6 +27,11 @@ class SQLStorage(StorageInterface):
         'constraints': [],
         'schema': None,  # Only need schema field as it's used everywhere
     }
+    
+    def __init__(self):
+        """Initialize the storage."""
+        # SUGGESTION: Add option for file rotation/rollover for very large exports
+        pass
     
     def save_data(
         self,
@@ -258,4 +265,258 @@ class SQLStorage(StorageInterface):
                 
         except Exception as e:
             logger.error(f"Failed to write schema for {metadata.name}: {str(e)}", exc_info=True)
-            raise StorageError(f"Failed to write schema: {str(e)}") 
+            raise StorageError(f"Failed to write schema: {str(e)}")
+    
+    def write_data(self, file_path: Path, data: str, append: bool = False) -> None:
+        """Write data to a file.
+        
+        Args:
+            file_path: Path to the file
+            data: Data to write
+            append: Whether to append to existing file
+            
+        Raises:
+            StorageError: If writing fails
+        """
+        # SUGGESTION: Add option to include checksums for data validation
+        try:
+            mode = 'a' if append else 'w'
+            file_path = Path(file_path)
+            
+            # Create directory if it doesn't exist
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            
+            # Write the data
+            with open(file_path, mode, encoding='utf-8') as f:
+                f.write(data)
+                # Write a newline to ensure the file ends with one
+                if data and not data.endswith('\n'):
+                    f.write('\n')
+        except Exception as e:
+            raise StorageError(f"Failed to write data to {file_path}: {str(e)}")
+    
+    def read_file(self, file_path: Path, compression: bool = False) -> Iterator[str]:
+        """Read a file line by line.
+        
+        Args:
+            file_path: Path to the file
+            compression: Whether the file is compressed
+            
+        Yields:
+            Lines from the file
+            
+        Raises:
+            StorageError: If reading fails
+        """
+        # SUGGESTION: Add support for resumable reading in case of interruption
+        try:
+            file_path = Path(file_path)
+            
+            if compression:
+                with gzip.open(file_path, 'rt', encoding='utf-8') as f:
+                    for line in f:
+                        yield line
+            else:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        yield line
+        except Exception as e:
+            raise StorageError(f"Failed to read file {file_path}: {str(e)}")
+            
+    def compress_file(self, file_path: Path, delete_original: bool = True) -> Path:
+        """Compress a file using gzip.
+        
+        Args:
+            file_path: Path to the file
+            delete_original: Whether to delete the original file
+            
+        Returns:
+            Path to the compressed file
+            
+        Raises:
+            StorageError: If compression fails
+        """
+        # SUGGESTION: Add support for different compression algorithms (zstd, lz4, etc.)
+        try:
+            file_path = Path(file_path)
+            compressed_path = file_path.with_suffix(file_path.suffix + '.gz')
+            
+            with open(file_path, 'rb') as f_in:
+                with gzip.open(compressed_path, 'wb') as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+                    
+            if delete_original:
+                os.remove(file_path)
+                
+            return compressed_path
+        except Exception as e:
+            raise StorageError(f"Failed to compress file {file_path}: {str(e)}")
+            
+    def decompress_file(self, file_path: Path, delete_original: bool = True) -> Path:
+        """Decompress a gzip file.
+        
+        Args:
+            file_path: Path to the file
+            delete_original: Whether to delete the original file
+            
+        Returns:
+            Path to the decompressed file
+            
+        Raises:
+            StorageError: If decompression fails
+        """
+        # SUGGESTION: Add support for different compression algorithms (zstd, lz4, etc.)
+        try:
+            file_path = Path(file_path)
+            
+            if not file_path.name.endswith('.gz'):
+                raise ValueError(f"File {file_path} is not a gzip file")
+                
+            decompressed_path = file_path.with_suffix('')
+            
+            with gzip.open(file_path, 'rb') as f_in:
+                with open(decompressed_path, 'wb') as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+                    
+            if delete_original:
+                os.remove(file_path)
+                
+            return decompressed_path
+        except Exception as e:
+            raise StorageError(f"Failed to decompress file {file_path}: {str(e)}")
+            
+    def file_exists(self, file_path: Path) -> bool:
+        """Check if a file exists.
+        
+        Args:
+            file_path: Path to the file
+            
+        Returns:
+            True if the file exists, False otherwise
+        """
+        # SUGGESTION: Add file locking mechanism to prevent concurrent access
+        return os.path.exists(file_path)
+        
+    def delete_file(self, file_path: Path) -> None:
+        """Delete a file.
+        
+        Args:
+            file_path: Path to the file
+            
+        Raises:
+            StorageError: If deletion fails
+        """
+        # SUGGESTION: Add support for secure deletion with file shredding for sensitive data
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        except Exception as e:
+            raise StorageError(f"Failed to delete file {file_path}: {str(e)}")
+            
+    def list_files(self, directory: Path, pattern: str = "*") -> List[Path]:
+        """List files in a directory matching a pattern.
+        
+        Args:
+            directory: Directory to list files in
+            pattern: Glob pattern for filtering files
+            
+        Returns:
+            List of file paths
+            
+        Raises:
+            StorageError: If listing fails
+        """
+        # SUGGESTION: Add support for recursive file listing with depth control
+        try:
+            return list(directory.glob(pattern))
+        except Exception as e:
+            raise StorageError(f"Failed to list files in {directory}: {str(e)}")
+            
+    def get_file_size(self, file_path: Path) -> int:
+        """Get the size of a file in bytes.
+        
+        Args:
+            file_path: Path to the file
+            
+        Returns:
+            File size in bytes
+            
+        Raises:
+            StorageError: If getting file size fails
+        """
+        # SUGGESTION: Add human-readable file size formatting utility
+        try:
+            return os.path.getsize(file_path)
+        except Exception as e:
+            raise StorageError(f"Failed to get size of file {file_path}: {str(e)}")
+            
+    def create_directory(self, directory: Path) -> None:
+        """Create a directory if it doesn't exist.
+        
+        Args:
+            directory: Directory to create
+            
+        Raises:
+            StorageError: If creation fails
+        """
+        # SUGGESTION: Add support for setting directory permissions
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except Exception as e:
+            raise StorageError(f"Failed to create directory {directory}: {str(e)}")
+            
+    def delete_directory(self, directory: Path, recursive: bool = False) -> None:
+        """Delete a directory.
+        
+        Args:
+            directory: Directory to delete
+            recursive: Whether to delete recursively
+            
+        Raises:
+            StorageError: If deletion fails
+        """
+        # SUGGESTION: Add dry-run option to see what would be deleted without actually deleting
+        try:
+            if recursive:
+                shutil.rmtree(directory)
+            else:
+                os.rmdir(directory)
+        except Exception as e:
+            raise StorageError(f"Failed to delete directory {directory}: {str(e)}")
+            
+    def get_file_extension(self, file_path: Path) -> str:
+        """Get the extension of a file.
+        
+        Args:
+            file_path: Path to the file
+            
+        Returns:
+            File extension
+        """
+        # SUGGESTION: Add support for handling multiple extensions (e.g., .tar.gz)
+        return file_path.suffix
+    
+    def get_file_name(self, file_path: Path) -> str:
+        """Get the name of a file without extension.
+        
+        Args:
+            file_path: Path to the file
+            
+        Returns:
+            File name without extension
+        """
+        # SUGGESTION: Add support for handling multiple extensions (e.g., .tar.gz)
+        return file_path.stem
+    
+    def append_to_path(self, base_path: Path, *parts: str) -> Path:
+        """Append parts to a base path.
+        
+        Args:
+            base_path: Base path
+            parts: Parts to append
+            
+        Returns:
+            Resulting path
+        """
+        # SUGGESTION: Add validation for path traversal vulnerabilities
+        return base_path.joinpath(*parts) 

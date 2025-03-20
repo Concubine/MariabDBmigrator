@@ -15,6 +15,9 @@ from src.infrastructure.mariadb import MariaDB
 from src.infrastructure.storage import SQLStorage
 from src.infrastructure.parallel import ParallelWorker, WorkerConfig
 
+# SUGGESTION: Add support for different input formats (CSV, JSON, Parquet)
+# SUGGESTION: Implement data validation with checksums during import
+
 logger = get_logger(__name__)
 
 class ImportService:
@@ -28,6 +31,8 @@ class ImportService:
             files: List of SQL files to import
             config: Import configuration
         """
+        # SUGGESTION: Add option for data transformation/filtering pipeline
+        # SUGGESTION: Support target table name mapping for importing to different table structures
         self.database = database
         self.files = files
         self.config = config
@@ -47,6 +52,8 @@ class ImportService:
         Raises:
             ImportError: If import fails
         """
+        # SUGGESTION: Add pre and post import hooks for extensibility
+        # SUGGESTION: Implement dry-run mode for validation without execution
         self.start_time = time.time()
         try:
             # Connect to database
@@ -79,6 +86,7 @@ class ImportService:
                             with open(Path(schema_file), 'r', encoding='utf-8') as f:
                                 content = f.read()
                                 # Extract database name from schema file
+                                # SUGGESTION: Use more robust SQL parsing instead of regex
                                 db_match = re.search(r'--\s*Database:\s*([^\s\r\n]+)', content, re.IGNORECASE)
                                 if db_match:
                                     target_database = db_match.group(1)
@@ -97,6 +105,7 @@ class ImportService:
                                 content = ''.join(f.readline() for _ in range(20))  # Read first 20 lines
                                 
                                 # Look for CREATE DATABASE or USE statements
+                                # SUGGESTION: Use sqlparse library for more robust SQL parsing
                                 db_match = re.search(r'CREATE\s+DATABASE\s+(?:IF\s+NOT\s+EXISTS\s+)?[`"]?([^`"\s;]+)[`"]?', content, re.IGNORECASE)
                                 if not db_match:
                                     # Updated regex to properly handle quoted database names and avoid including trailing punctuation
@@ -139,6 +148,7 @@ class ImportService:
                         logger.info(f"Using database name from configuration: {target_database}")
                     else:
                         # Use the original name if specified in file, otherwise fall back to default
+                        # SUGGESTION: Allow configuring default database name
                         target_database = "imported_db" 
                         logger.info(f"No database found in SQL files or configuration. Using default name: {target_database}")
                     
@@ -156,6 +166,7 @@ class ImportService:
             logger.info(f"Using database '{self.database.database}' for import")
             
             # Disable foreign key checks globally if configured
+            # SUGGESTION: Add option to selectively disable foreign keys only for specific tables
             foreign_keys_disabled = False
             if self.config.disable_foreign_keys:
                 logger.info("Disabling foreign key checks globally for import process")
@@ -167,6 +178,7 @@ class ImportService:
                 results = []
                 
                 # Sort files to ensure schema files are processed before data files
+                # SUGGESTION: Move file sorting logic to a separate method for better maintainability
                 def file_sort_key(file_path):
                     """Sort key function for import files.
                     
@@ -199,62 +211,80 @@ class ImportService:
                     except Exception as e:
                         logger.warning(f"Error reading file {path} for sorting: {str(e)}")
                     
-                    # Fallback to filename-based ordering
-                    if '_data' in path.name:
-                        return 1  # Assume data file based on name
-                    else:
-                        return 0  # Assume schema file based on name
+                    # Default to middle priority if can't determine
+                    return 0.5  # Between schema and data
                 
+                # Sort the files to process schema files first
                 sorted_files = sorted(self.files, key=file_sort_key)
-                logger.info(f"Processing files in order: {', '.join([Path(f).name for f in sorted_files])}")
                 
-                # Count total SQL statements for progress estimation
+                # Count total statements in all files for progress tracking
+                # SUGGESTION: Make this count optional with a flag for faster startup with large files
                 self.total_statements = self._count_statements_in_files(sorted_files)
-                logger.info(f"Total SQL statements to process: {self.total_statements}")
+                logger.info(f"Found {self.total_statements} SQL statements to process in {len(sorted_files)} files")
                 
+                # Process each file
                 file_count = len(sorted_files)
                 for i, file_path in enumerate(sorted_files, 1):
-                    # Update progress with file count
-                    self.files_processed += 1
-                    elapsed_time = time.time() - self.start_time
-                    estimated_total = 0
-                    
-                    if i > 1:
-                        # Estimate based on files processed so far
-                        estimated_total = (elapsed_time / (i - 1)) * file_count
-                        remaining_time = max(0, estimated_total - elapsed_time)
-                        logger.info(f"Progress: {i-1}/{file_count} files completed. Estimated time remaining: {self._format_time(remaining_time)}")
-                    
-                    # Import the file
+                    # SUGGESTION: Add progress callback for UI integration
                     logger.info(f"Processing file {i}/{file_count}: {Path(file_path).name}")
-                    result = self._import_file(Path(file_path))
-                    results.append(result)
+                    
+                    # Display progress estimation
+                    if i > 1:
+                        elapsed = time.time() - self.start_time
+                        progress_factor = max(0.25, (i-1)/file_count)  # Start at 0.25 (4x) and approach 1.0
+                        estimated_total = (elapsed / ((i-1) * progress_factor)) * file_count
+                        remaining = estimated_total - elapsed
+                        logger.info(f"Progress: {((i-1)/file_count)*100:.1f}% ({i-1}/{file_count} files). Estimated time remaining: {self._format_time(remaining)}")
+                    
+                    try:
+                        # Import the file
+                        result = self._import_file(Path(file_path))
+                        results.append(result)
+                        self.files_processed += 1
+                    except Exception as e:
+                        logger.error(f"Error processing file {file_path}: {str(e)}")
+                        # Add a failed result
+                        results.append(ImportResult(
+                            table_name=Path(file_path).stem,
+                            status="ERROR",
+                            error_message=str(e)
+                        ))
+                        
+                        # Re-raise if not configured to continue on error
+                        if not self.config.continue_on_error:
+                            raise ImportError(f"Import failed: {str(e)}")
                 
-                # After all files have been imported, try to apply any failed constraints
+                # Retry any failed constraints at the end
+                # SUGGESTION: Implement more sophisticated constraint dependency resolution
                 if self.failed_constraints:
-                    logger.info(f"Retrying {len(self.failed_constraints)} failed constraints after all tables have been created")
-                    for constraint_info in self.failed_constraints:
+                    logger.info(f"Attempting to apply {len(self.failed_constraints)} failed constraints")
+                    successful_constraints = 0
+                    
+                    for constraint in self.failed_constraints:
                         try:
-                            table_name = constraint_info['table']
-                            stmt = constraint_info['stmt']
-                            logger.info(f"Retrying constraint for table {table_name}: {stmt[:50]}...")
-                            self.db.execute(stmt)
-                            logger.info(f"Successfully added constraint for {table_name}")
+                            self.db.execute(constraint)
+                            successful_constraints += 1
                         except Exception as e:
-                            logger.warning(f"Error applying constraint in second pass: {str(e)}")
+                            logger.warning(f"Failed to apply constraint: {str(e)}\nConstraint: {constraint}")
+                    
+                    logger.info(f"Successfully applied {successful_constraints}/{len(self.failed_constraints)} previously failed constraints")
                 
-                # Display final statistics
+                # Display statistics
                 total_time = time.time() - self.start_time
-                logger.info(f"Total import completed in {self._format_time(total_time)}")
-                logger.info(f"Processed {self.statements_processed} statements from {file_count} files")
+                logger.info(f"Import completed in {self._format_time(total_time)}")
+                logger.info(f"Processed {self.files_processed} files with {self.statements_processed} SQL statements")
                 
                 return results
+                
             finally:
                 # Re-enable foreign key checks if they were disabled
                 if foreign_keys_disabled:
                     logger.info("Re-enabling foreign key checks")
-                    self.db.execute("SET FOREIGN_KEY_CHECKS=1")
-            
+                    try:
+                        self.db.execute("SET FOREIGN_KEY_CHECKS=1")
+                    except Exception as e:
+                        logger.warning(f"Error re-enabling foreign key checks: {str(e)}")
+        
         except Exception as e:
             raise ImportError(f"Import failed: {str(e)}")
             
@@ -447,9 +477,11 @@ class ImportService:
                             progress_percent = (self.statements_processed / self.total_statements) * 100
                             elapsed_time = time.time() - self.start_time
                             if self.statements_processed > 1:
-                                estimated_total = (elapsed_time / self.statements_processed) * self.total_statements
+                                # Start with 4x higher estimate and gradually decrease as we make progress
+                                progress_factor = max(0.25, self.statements_processed/self.total_statements)  # Start at 0.25 (4x) and approach 1.0
+                                estimated_total = (elapsed_time / (self.statements_processed * progress_factor)) * self.total_statements
                                 remaining_time = max(0, estimated_total - elapsed_time)
-                                logger.info(f"Statement progress: {progress_percent:.1f}% ({self.statements_processed}/{self.total_statements}). Estimated time remaining: {self._format_time(remaining_time)}")
+                                logger.info(f"Statement progress: {progress_percent:.1f}% ({self.statements_processed}/{self.total_statements}). TOTAL statements in queue: {self.total_statements}. Estimated time remaining: {self._format_time(remaining_time)}")
                             
                     except Exception as e:
                         # If we're in continue-on-error mode, just log the error and continue
@@ -479,9 +511,11 @@ class ImportService:
                             progress_percent = (self.statements_processed / self.total_statements) * 100
                             elapsed_time = time.time() - self.start_time
                             if self.statements_processed > 1:
-                                estimated_total = (elapsed_time / self.statements_processed) * self.total_statements
+                                # Start with 4x higher estimate and gradually decrease as we make progress
+                                progress_factor = max(0.25, self.statements_processed/self.total_statements)  # Start at 0.25 (4x) and approach 1.0
+                                estimated_total = (elapsed_time / (self.statements_processed * progress_factor)) * self.total_statements
                                 remaining_time = max(0, estimated_total - elapsed_time)
-                                logger.info(f"Statement progress: {progress_percent:.1f}% ({self.statements_processed}/{self.total_statements}). Estimated time remaining: {self._format_time(remaining_time)}")
+                                logger.info(f"Statement progress: {progress_percent:.1f}% ({self.statements_processed}/{self.total_statements}). TOTAL statements in queue: {self.total_statements}. Estimated time remaining: {self._format_time(remaining_time)}")
                         
                     except Exception as e:
                         if self.config.continue_on_error:
@@ -510,9 +544,11 @@ class ImportService:
                             progress_percent = (self.statements_processed / self.total_statements) * 100
                             elapsed_time = time.time() - self.start_time
                             if self.statements_processed > 1:
-                                estimated_total = (elapsed_time / self.statements_processed) * self.total_statements
+                                # Start with 4x higher estimate and gradually decrease as we make progress
+                                progress_factor = max(0.25, self.statements_processed/self.total_statements)  # Start at 0.25 (4x) and approach 1.0
+                                estimated_total = (elapsed_time / (self.statements_processed * progress_factor)) * self.total_statements
                                 remaining_time = max(0, estimated_total - elapsed_time)
-                                logger.info(f"Statement progress: {progress_percent:.1f}% ({self.statements_processed}/{self.total_statements}). Estimated time remaining: {self._format_time(remaining_time)}")
+                                logger.info(f"Statement progress: {progress_percent:.1f}% ({self.statements_processed}/{self.total_statements}). TOTAL statements in queue: {self.total_statements}. Estimated time remaining: {self._format_time(remaining_time)}")
                         
                     except Exception as e:
                         # Store failed constraints to retry later after all tables are created
@@ -530,7 +566,7 @@ class ImportService:
                 # Configure worker for parallel processing if needed
                 if self.config.parallel_workers > 1:
                     worker_config = WorkerConfig(
-                        max_workers=self.config.parallel_workers,
+                        num_workers=self.config.parallel_workers,
                         batch_size=self.config.batch_size
                     )
                     with ParallelWorker(worker_config) as worker:
@@ -568,9 +604,11 @@ class ImportService:
                             progress_percent = (self.statements_processed / self.total_statements) * 100
                             elapsed_time = time.time() - self.start_time
                             if self.statements_processed > 1:
-                                estimated_total = (elapsed_time / self.statements_processed) * self.total_statements
+                                # Start with 4x higher estimate and gradually decrease as we make progress
+                                progress_factor = max(0.25, self.statements_processed/self.total_statements)  # Start at 0.25 (4x) and approach 1.0
+                                estimated_total = (elapsed_time / (self.statements_processed * progress_factor)) * self.total_statements
                                 remaining_time = max(0, estimated_total - elapsed_time)
-                                logger.info(f"Statement progress: {progress_percent:.1f}% ({self.statements_processed}/{self.total_statements}). Estimated time remaining: {self._format_time(remaining_time)}")
+                                logger.info(f"Statement progress: {progress_percent:.1f}% ({self.statements_processed}/{self.total_statements}). TOTAL statements in queue: {self.total_statements}. Estimated time remaining: {self._format_time(remaining_time)}")
                 else:
                     # Sequential processing
                     for i, stmt in enumerate(data_statements):
@@ -594,9 +632,11 @@ class ImportService:
                                 progress_percent = (self.statements_processed / self.total_statements) * 100
                                 elapsed_time = time.time() - self.start_time
                                 if self.statements_processed > 1:
-                                    estimated_total = (elapsed_time / self.statements_processed) * self.total_statements
+                                    # Start with 4x higher estimate and gradually decrease as we make progress
+                                    progress_factor = max(0.25, self.statements_processed/self.total_statements)  # Start at 0.25 (4x) and approach 1.0
+                                    estimated_total = (elapsed_time / (self.statements_processed * progress_factor)) * self.total_statements
                                     remaining_time = max(0, estimated_total - elapsed_time)
-                                    logger.info(f"Statement progress: {progress_percent:.1f}% ({self.statements_processed}/{self.total_statements}). Estimated time remaining: {self._format_time(remaining_time)}")
+                                    logger.info(f"Statement progress: {progress_percent:.1f}% ({self.statements_processed}/{self.total_statements}). TOTAL statements in queue: {self.total_statements}. Estimated time remaining: {self._format_time(remaining_time)}")
                             
                         except Exception as e:
                             if self.config.continue_on_error:

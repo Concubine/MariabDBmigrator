@@ -2,6 +2,7 @@
 import argparse
 import sys
 import datetime
+import signal
 from pathlib import Path
 from typing import Optional
 import logging
@@ -13,8 +14,41 @@ from src.services.import_ import ImportService
 from src.domain.models import ImportMode
 from src.core.exceptions import ConfigError, DatabaseError, StorageError, ExportError, ImportError
 
+# SUGGESTION: Consider moving license expiration to configuration file for easier updates
+# SUGGESTION: Add version number constant at the top of the file for tracking
+# SUGGESTION: Consider implementing a plugin system for extensibility
+
 # License expiration date (March 20, 2027)
-EXPIRATION_DATE = datetime.date(2024, 3, 20)
+EXPIRATION_DATE = datetime.date(2027, 3, 20)
+
+# Global service variables to access in signal handler
+export_service = None
+import_service = None
+
+def signal_handler(sig, frame):
+    """Handle SIGINT (Ctrl+C) signal for graceful exit.
+    
+    Args:
+        sig: Signal number
+        frame: Current stack frame
+    """
+    print("\nReceived interrupt signal. Cleaning up and exiting gracefully...")
+    logging.info("Received interrupt signal. Performing cleanup before exit.")
+    
+    # Cleanup resources
+    if export_service is not None and hasattr(export_service, 'db'):
+        logging.info("Closing export database connection")
+        export_service.db.disconnect()
+    
+    if import_service is not None and hasattr(import_service, 'db'):
+        logging.info("Closing import database connection")
+        import_service.db.disconnect()
+    
+    print("Cleanup complete. Exiting.")
+    logging.info("Cleanup complete. Exiting.")
+    sys.exit(0)
+
+# SUGGESTION: Add a function to check for new version availability
 
 def check_license_expiration() -> bool:
     """Check if the software license has expired.
@@ -22,6 +56,9 @@ def check_license_expiration() -> bool:
     Returns:
         bool: True if the license is still valid, False if expired
     """
+    # SUGGESTION: Add telemetry/usage tracking with opt-out option
+    # SUGGESTION: Implement proper license validation with cryptographic signature instead of hardcoded date
+    
     current_date = datetime.date.today()
     if current_date > EXPIRATION_DATE:
         print("\n****************************************************************")
@@ -38,6 +75,7 @@ def check_license_expiration() -> bool:
     days_remaining = (EXPIRATION_DATE - current_date).days
     
     # Warn if expiration is approaching (within 30 days)
+    # SUGGESTION: Make the warning threshold configurable
     if days_remaining <= 30:
         print("\n****************************************************************")
         print("*                                                              *")
@@ -50,6 +88,9 @@ def check_license_expiration() -> bool:
 
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
+    # SUGGESTION: Consider using a library like click or typer for more maintainable CLI code
+    # SUGGESTION: Add command completion support for better user experience
+    
     parser = argparse.ArgumentParser(description="MariaDB database export/import tool")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
     
@@ -69,6 +110,8 @@ def parse_args() -> argparse.Namespace:
     export_parser.add_argument("--exclude-data", nargs="+", help="Tables to export without data")
     export_parser.add_argument("--information-schema", action="store_true", help="Export information_schema database")
     export_parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
+    # SUGGESTION: Add --dry-run option to show what would be exported without actually exporting
+    # SUGGESTION: Add --format option to support different export formats (SQL, CSV, JSON, etc.)
     
     # Import command
     import_parser = subparsers.add_parser("import", help="Import database tables")
@@ -87,9 +130,13 @@ def parse_args() -> argparse.Namespace:
     import_parser.add_argument("--import-schema", action="store_true", help="Import table schema")
     import_parser.add_argument("--import-data", action="store_true", help="Import table data")
     import_parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
+    # SUGGESTION: Add --dry-run option to parse and validate SQL without executing
+    # SUGGESTION: Add progress bar option with rich or tqdm libraries
     
     # Global options
     parser.add_argument("--config", help="Path to configuration file")
+    # SUGGESTION: Add --version flag to display version information
+    # SUGGESTION: Add --quiet flag to suppress all output except errors
     
     args = parser.parse_args()
     
@@ -102,6 +149,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     """Main entry point."""
+    global export_service, import_service
+    
+    # Register signal handler for graceful exit on Ctrl+C
+    signal.signal(signal.SIGINT, signal_handler)
+    
     # Check if license has expired
     if not check_license_expiration():
         return 1
@@ -120,6 +172,7 @@ def main() -> int:
     setup_logging(config.logging)
     
     # Log configuration
+    # SUGGESTION: Mask sensitive information like passwords more systematically with dedicated utility function
     log_config({
         'database': {
             'host': config.database.host,
@@ -172,6 +225,7 @@ def main() -> int:
     try:
         if args.command == "export":
             # Override config with command line arguments
+            # SUGGESTION: Extract command-line overrides to a separate function for readability
             if args.tables:
                 config.export.tables = args.tables
             if args.databases and not config.database.database:
@@ -204,11 +258,13 @@ def main() -> int:
                 config.database.database = ""
             
             # Create export service
-            service = ExportService(config.database, config.export)
-            service.export_data()
+            export_service = ExportService(config.database, config.export)
+            # SUGGESTION: Add progress reporting with a callback mechanism
+            export_service.export_data()
             
         elif args.command == "import":
             # Override config with command line arguments
+            # SUGGESTION: Extract command-line overrides to a separate function for readability
             if args.input_dir:
                 config.import_.input_dir = args.input_dir
             if args.database:
@@ -254,8 +310,9 @@ def main() -> int:
                     return 1
             
             # Create import service
-            service = ImportService(config.database, import_files, config.import_)
-            service.import_data()
+            import_service = ImportService(config.database, import_files, config.import_)
+            # SUGGESTION: Add progress reporting with a callback mechanism
+            import_service.import_data()
             
         else:
             print("Error: No command specified")
@@ -284,9 +341,17 @@ def main() -> int:
         print(f"Import error: {str(e)}")
         return 1
     except Exception as e:
+        # SUGGESTION: Add option to capture and report crash details to developers
         logging.error(f"Unexpected error: {str(e)}", exc_info=True)
         print(f"Error: {str(e)}")
         return 1
+    finally:
+        # Clean up resources
+        if export_service is not None and hasattr(export_service, 'db'):
+            export_service.db.disconnect()
+        if import_service is not None and hasattr(import_service, 'db'):
+            import_service.db.disconnect()
 
 if __name__ == "__main__":
+    # SUGGESTION: Add profiling option to identify performance bottlenecks
     sys.exit(main())

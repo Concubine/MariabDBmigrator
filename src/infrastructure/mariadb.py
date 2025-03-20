@@ -14,6 +14,10 @@ from src.core.logging import get_logger
 from ..domain.interfaces import DatabaseInterface
 from ..domain.models import TableMetadata, ColumnMetadata, DatabaseConfig
 
+# SUGGESTION: Add support for connection pooling for improved performance
+# SUGGESTION: Add support for server-side prepared statements
+# SUGGESTION: Implement connection retry logic with exponential backoff
+
 logger = get_logger(__name__)
 
 # Define MySQL native password implementation here so we don't depend on the missing module
@@ -53,6 +57,7 @@ class MySQLNativePasswordAuthPlugin:
         import struct
         from hashlib import sha1
         
+        # SUGGESTION: Add proper error handling for invalid auth_data formats
         # Handle different auth_data types
         if hasattr(auth_data, 'read_all'):
             # If auth_data is a socket or similar object with read_all method, 
@@ -120,6 +125,7 @@ class MySQLNativePasswordAuthPlugin:
         # Pass all the information to auth_response to handle properly
         return self.auth_response(auth_data, **kwargs)
 
+# SUGGESTION: Refactor authentication plugins into separate module for better organization
 # Define SHA256 Password implementation
 class SHA256PasswordAuthPlugin:
     """Minimal implementation of SHA256 Password authentication plugin."""
@@ -158,6 +164,7 @@ class SHA256PasswordAuthPlugin:
         
         Our implementation handles both cases.
         """
+        # SUGGESTION: Add proper error handling for invalid auth_data formats
         # Handle different auth_data types
         if hasattr(auth_data, 'read_all'):
             logger.debug("Received socket-like object as auth_data, attempting to read data")
