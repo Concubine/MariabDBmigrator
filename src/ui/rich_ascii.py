@@ -56,6 +56,8 @@ class ConsoleAreaHandler(logging.Handler):
         try:
             message = self.format(record)
             self.rich_interface._log_to_console(message)
+            # Also add to the rich log viewer if it's enabled
+            self.rich_interface._add_to_log_viewer(record)
         except Exception:
             self.handleError(record)
 
@@ -87,6 +89,13 @@ class RichASCIIInterface:
             TextColumn("[cyan]{task.fields[speed]}/sec")
         )
         
+        # Track the last update time to prevent too frequent updates causing flicker
+        self.last_update_time = time.time()
+        self.update_interval = 0.2  # Minimum seconds between updates
+        
+        # Store the last stats update to avoid unnecessary redraws
+        self.last_stats = {}
+        
         # Print newlines to leave space for console logs at the bottom
         self._reserve_console_space()
         
@@ -106,6 +115,38 @@ class RichASCIIInterface:
         
         # Add the handler to the root logger
         logging.getLogger().addHandler(handler)
+    
+    def _add_to_log_viewer(self, record):
+        """Add a log record to the rich log viewer."""
+        if self.show_logs and hasattr(self, 'log_viewer'):
+            try:
+                # Format the time
+                log_time = datetime.fromtimestamp(record.created).strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]
+                
+                # Create an entry similar to how LogViewer processes log lines
+                entry = {
+                    'timestamp': log_time,
+                    'module': record.name,
+                    'level': record.levelname,
+                    'message': record.getMessage(),
+                    'raw': f"{log_time} - {record.name} - {record.levelname} - {record.getMessage()}"
+                }
+                
+                # Add entry directly to LogViewer's entries list with its lock
+                if hasattr(self.log_viewer, 'log_lock') and hasattr(self.log_viewer, 'log_entries'):
+                    with self.log_viewer.log_lock:
+                        self.log_viewer.log_entries.append(entry)
+                        # Trim the log entries if needed
+                        if len(self.log_viewer.log_entries) > self.log_viewer.max_entries:
+                            self.log_viewer.log_entries = self.log_viewer.log_entries[-self.log_viewer.max_entries:]
+                
+                # Update the logs panel if we have an active display
+                if self.progress_layout and "main" in self.progress_layout and "logs" in self.progress_layout["main"]:
+                    self.progress_layout["main"]["logs"].update(self.log_viewer.render())
+            except Exception as e:
+                # Don't crash if log update fails
+                self.logger.debug(f"Failed to add log record to viewer: {str(e)}")
+                pass
     
     def _get_terminal_size(self):
         """Get the terminal size."""
@@ -141,7 +182,7 @@ class RichASCIIInterface:
         # Create header with title
         header_text = Text("MariaDB Export/Import Tool", style="bold white on blue")
         header_text.justify = "center"
-        layout["header"].update(Panel(header_text))
+        layout["header"].update(Panel(header_text, border_style="blue"))
         
         # Create main layout
         main_layout = layout["main"]
@@ -166,15 +207,25 @@ class RichASCIIInterface:
             )
             
             # Create empty stats panel - will be populated later
+            stats_table = Table(box=box.ROUNDED, show_header=False, expand=True, highlight=True)
+            stats_table.add_column("Key", style="cyan")
+            stats_table.add_column("Value", style="yellow")
+            stats_table.add_row("Status", "Waiting for operation to start...")
+            
             main_layout["upper_main"]["stats"].update(
-                Panel(Text("Waiting for operation to start..."), title="Operation Statistics", border_style="cyan")
+                Panel(stats_table, title="Operation Statistics", border_style="cyan")
             )
+            
+            # Create log viewer panel
+            log_panel = Panel(
+                self.log_viewer.render(),
+                title="Recent Logs", 
+                border_style="blue"
+            )
+            main_layout["logs"].update(log_panel)
             
             # Start monitoring logs
             self.log_viewer.start_monitoring()
-            
-            # Add log viewer
-            main_layout["logs"].update(self.log_viewer.render())
         else:
             # If no logs, just split main into progress and stats directly
             main_layout.split_row(
@@ -187,9 +238,14 @@ class RichASCIIInterface:
                 Panel(self.progress, title="Operation Progress", border_style="green")
             )
             
-            # Create empty stats panel - will be populated later
+            # Create empty stats panel with initial content
+            stats_table = Table(box=box.ROUNDED, show_header=False, expand=True, highlight=True)
+            stats_table.add_column("Key", style="cyan")
+            stats_table.add_column("Value", style="yellow")
+            stats_table.add_row("Status", "Waiting for operation to start...")
+            
             main_layout["stats"].update(
-                Panel(Text("Waiting for operation to start..."), title="Operation Statistics", border_style="cyan")
+                Panel(stats_table, title="Operation Statistics", border_style="cyan")
             )
         
         # Footer with info
@@ -203,6 +259,13 @@ class RichASCIIInterface:
         """Update the stats panel with current operation statistics."""
         if not self.progress_layout:
             return
+        
+        # Check if the stats have changed significantly to avoid unnecessary updates
+        if self._are_stats_similar(stats, self.last_stats):
+            return
+            
+        # Store these stats for comparison next time
+        self.last_stats = stats.copy()
         
         try:
             # Create stats table
@@ -219,29 +282,58 @@ class RichASCIIInterface:
                     # Format time values
                     value = self._format_time(value)
                     
+                # Special case for progress percentage
+                if key == "progress":
+                    value = f"[bold green]{value}[/]"
+                
+                # Special case for status
+                if key == "status" and value == "Completed":
+                    value = f"[bold green]{value}[/]"
+                    
                 stats_table.add_row(key.replace("_", " ").title(), str(value))
             
             # Directly use a more specific path to update the stats panel
+            panel = Panel(stats_table, title="Operation Statistics", border_style="cyan")
+            
             if self.show_logs and "main" in self.progress_layout:
                 if "upper_main" in self.progress_layout["main"]:
                     if "stats" in self.progress_layout["main"]["upper_main"]:
-                        self.progress_layout["main"]["upper_main"]["stats"].update(
-                            Panel(stats_table, title="Operation Statistics", border_style="cyan")
-                        )
+                        self.progress_layout["main"]["upper_main"]["stats"].update(panel)
             elif "main" in self.progress_layout:
                 if "stats" in self.progress_layout["main"]:
-                    self.progress_layout["main"]["stats"].update(
-                        Panel(stats_table, title="Operation Statistics", border_style="cyan")
-                    )
-            
-            # Update logs if enabled
-            if self.show_logs and "main" in self.progress_layout and "logs" in self.progress_layout["main"]:
-                self.progress_layout["main"]["logs"].update(self.log_viewer.render())
+                    self.progress_layout["main"]["stats"].update(panel)
                 
         except Exception as e:
             # If we can't update the stats panel, log the error but don't crash
             self.logger.warning(f"Error updating stats panel: {str(e)}")
-            # We still want to continue with the program even if the UI has issues
+    
+    def _are_stats_similar(self, stats1: Dict[str, Any], stats2: Dict[str, Any]) -> bool:
+        """Check if two sets of stats are similar enough to skip updating the display."""
+        if not stats2:  # If no previous stats, always update
+            return False
+            
+        # Check if keys match
+        if set(stats1.keys()) != set(stats2.keys()):
+            return False
+            
+        # Check progress percentage - update if it's changed by more than 1%
+        if "progress" in stats1 and "progress" in stats2:
+            progress1 = float(stats1["progress"].rstrip("%"))
+            progress2 = float(stats2["progress"].rstrip("%"))
+            if abs(progress1 - progress2) > 1.0:
+                return False
+                
+        # Check processed items - update if changed by more than 5%
+        if "processed_items" in stats1 and "processed_items" in stats2 and "total_items" in stats1:
+            if stats1["total_items"] > 0:
+                items1 = stats1["processed_items"]
+                items2 = stats2["processed_items"]
+                total = stats1["total_items"]
+                if abs(items1 - items2) / total > 0.05:
+                    return False
+        
+        # If we got here, stats are similar enough to skip update
+        return True
     
     def _bring_to_foreground(self):
         """Bring the console window to the foreground."""
@@ -263,6 +355,12 @@ class RichASCIIInterface:
     def display_progress(self, stats: ProgressStats) -> None:
         """Display progress information in Rich ASCII format."""
         try:
+            # Throttle updates to reduce flicker
+            current_time = time.time()
+            if current_time - self.last_update_time < self.update_interval:
+                return
+            self.last_update_time = current_time
+            
             # Check if terminal size has changed and update if needed
             new_height, new_width = self._get_terminal_size()
             if new_height != self.terminal_height or new_width != self.terminal_width:
@@ -275,7 +373,8 @@ class RichASCIIInterface:
                     self.live_display = Live(
                         self.progress_layout, 
                         refresh_per_second=4,
-                        vertical_overflow="crop"
+                        vertical_overflow="crop",
+                        auto_refresh=True
                     )
                     self.live_display.start()
             
@@ -285,7 +384,8 @@ class RichASCIIInterface:
                 self.live_display = Live(
                     self.progress_layout, 
                     refresh_per_second=4,
-                    vertical_overflow="crop"
+                    vertical_overflow="crop",
+                    auto_refresh=True
                 )
                 self.live_display.start()
                 
@@ -299,36 +399,46 @@ class RichASCIIInterface:
             
             # Ensure we have a valid task_id before updating progress
             if self.task_id is not None:
+                # Format speed as an integer for cleaner display
+                speed_str = f"{int(stats.current_speed)}"
+                
                 # Update progress bar
-                speed_str = f"{stats.current_speed:.1f}"
                 self.progress.update(
                     self.task_id, 
                     completed=stats.processed_items,
                     speed=speed_str
                 )
                 
-                # Update stats panel - only if we have a valid progress_layout
+                # Update stats panel with more information
                 if self.progress_layout:
+                    elapsed_time = (datetime.now() - stats.start_time).total_seconds()
                     self._update_stats_panel({
+                        "status": "Active",
                         "total_items": stats.total_items,
                         "processed_items": stats.processed_items,
                         "progress": f"{stats.percentage_complete:.1f}%",
-                        "current_speed": f"{stats.current_speed:.1f} items/sec", 
-                        "elapsed_time": (datetime.now() - stats.start_time).total_seconds(),
-                        "estimated_time_remaining": stats.estimated_time_remaining
+                        "current_speed": f"{int(stats.current_speed)} items/sec", 
+                        "elapsed_time": elapsed_time,
+                        "estimated_remaining": stats.estimated_time_remaining,
+                        "estimated_completion": time.strftime('%H:%M:%S', time.localtime(time.time() + stats.estimated_time_remaining))
                     })
+                
+                # Force a refresh of the live display
+                if self.live_display:
+                    self.live_display.refresh()
             
             # Only log to console at certain intervals to avoid overwhelming logs
             if (stats.percentage_complete < 1 or
                 stats.percentage_complete > 99 or
                 stats.percentage_complete % 10 < 0.5):  # Log at 0%, 10%, 20%... and >99%
                 # Position cursor at console log area before logging
-                self._log_to_console(
+                message = (
                     f"Progress: {stats.percentage_complete:.1f}% | "
                     f"Processed: {stats.processed_items}/{stats.total_items} | "
-                    f"Speed: {stats.current_speed:.2f} items/s | "
+                    f"Speed: {int(stats.current_speed)} items/s | "
                     f"ETA: {self._format_time(stats.estimated_time_remaining)}"
                 )
+                self._log_to_console(message)
                 
         except Exception as e:
             # If display fails, log the error and continue
@@ -374,14 +484,19 @@ class RichASCIIInterface:
                     # Update stats panel to show completion if possible
                     if self.progress_layout:
                         self._update_stats_panel({
+                            "status": "Completed",
                             "total_items": task.total,
                             "processed_items": task.total,
                             "progress": "100.0%",
-                            "current_speed": "0.0 items/sec", 
+                            "current_speed": "0 items/sec", 
                             "elapsed_time": task.elapsed,
-                            "estimated_time_remaining": 0.0,
-                            "status": "Completed"
+                            "estimated_remaining": 0.0,
+                            "completion_time": time.strftime('%H:%M:%S', time.localtime())
                         })
+                
+                # Force a final refresh 
+                if self.live_display:
+                    self.live_display.refresh()
                 
                 # Sleep briefly to ensure the UI updates before proceeding
                 time.sleep(0.5)
@@ -403,6 +518,9 @@ class RichASCIIInterface:
                 
                 self.active_progress = None
                 self.task_id = None
+                
+                # Clear the last stats to ensure fresh display for next operation
+                self.last_stats = {}
     
     def display_export_result(self, result: ExportResult) -> None:
         """Display the result of an export operation."""
