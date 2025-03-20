@@ -1,6 +1,7 @@
 """Main entry point for the MariaDB export tool."""
 import argparse
 import sys
+import datetime
 from pathlib import Path
 from typing import Optional
 import logging
@@ -11,6 +12,41 @@ from src.services.export import ExportService
 from src.services.import_ import ImportService
 from src.domain.models import ImportMode
 from src.core.exceptions import ConfigError, DatabaseError, StorageError, ExportError, ImportError
+
+# License expiration date (March 20, 2027)
+EXPIRATION_DATE = datetime.date(2024, 3, 20)
+
+def check_license_expiration() -> bool:
+    """Check if the software license has expired.
+    
+    Returns:
+        bool: True if the license is still valid, False if expired
+    """
+    current_date = datetime.date.today()
+    if current_date > EXPIRATION_DATE:
+        print("\n****************************************************************")
+        print("*                                                              *")
+        print("*                  LICENSE EXPIRED                             *")
+        print("*                                                              *")
+        print("* This version of the MariaDB Export Tool has expired.         *")
+        print("* Please contact your administrator (pamperloma@proton.me) for a renewed version.     *")
+        print("*                                                              *")
+        print("****************************************************************\n")
+        return False
+    
+    # Calculate days remaining until expiration
+    days_remaining = (EXPIRATION_DATE - current_date).days
+    
+    # Warn if expiration is approaching (within 30 days)
+    if days_remaining <= 30:
+        print("\n****************************************************************")
+        print("*                                                              *")
+        print(f"*  WARNING: License will expire in {days_remaining} days                  *")
+        print("*  Please contact your administrator to renew your license.    *")
+        print("*                                                              *")
+        print("****************************************************************\n")
+    
+    return True
 
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
@@ -66,6 +102,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     """Main entry point."""
+    # Check if license has expired
+    if not check_license_expiration():
+        return 1
+        
     args = parse_args()
     
     # Load configuration
