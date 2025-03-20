@@ -4,6 +4,7 @@ import time
 import os
 import shutil
 import logging
+import ctypes
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 from datetime import datetime
@@ -91,6 +92,9 @@ class RichASCIIInterface:
         
         # Set up console area logging handler
         self._setup_console_logger()
+        
+        # Bring window to foreground if we're on Windows
+        self._bring_to_foreground()
     
     def _setup_console_logger(self):
         """Set up a logging handler to redirect logs to the console area."""
@@ -125,7 +129,7 @@ class RichASCIIInterface:
         # Calculate available height for the dashboard (total - reserved for console)
         available_height = self.terminal_height - self.log_console_lines - 1  # -1 for safety
         
-        layout = Layout()
+        layout = Layout(name="root")
         
         # Split the layout into sections
         layout.split(
@@ -139,39 +143,59 @@ class RichASCIIInterface:
         header_text.justify = "center"
         layout["header"].update(Panel(header_text))
         
-        # Split main section into progress and stats
-        layout["main"].split_row(
-            Layout(name="progress", ratio=2),
-            Layout(name="stats", ratio=1),
-        )
-        
-        # Create progress panel
-        layout["progress"].update(Panel(self.progress, title="Operation Progress", border_style="green"))
-        
-        # Footer with info
-        footer_text = Text("Press Ctrl+C to cancel | Console logs shown below", style="italic")
-        footer_text.justify = "center"
-        layout["footer"].update(Panel(footer_text))
+        # Create main layout
+        main_layout = layout["main"]
         
         # Add rich logs section if enabled (separate from console logs)
         if self.show_logs:
             # Split the main section to add logs at the bottom
-            layout["main"].split(
+            main_layout.split(
                 Layout(name="upper_main", ratio=3),
                 Layout(name="logs", ratio=2)
             )
             
-            # Move existing layouts into upper_main
-            layout["upper_main"].split_row(
+            # Split upper_main into progress and stats
+            main_layout["upper_main"].split_row(
                 Layout(name="progress", ratio=2),
-                Layout(name="stats", ratio=1),
+                Layout(name="stats", ratio=1)
+            )
+            
+            # Add progress and stats panels
+            main_layout["upper_main"]["progress"].update(
+                Panel(self.progress, title="Operation Progress", border_style="green")
+            )
+            
+            # Create empty stats panel - will be populated later
+            main_layout["upper_main"]["stats"].update(
+                Panel(Text("Waiting for operation to start..."), title="Operation Statistics", border_style="cyan")
             )
             
             # Start monitoring logs
             self.log_viewer.start_monitoring()
             
             # Add log viewer
-            layout["logs"].update(self.log_viewer.render())
+            main_layout["logs"].update(self.log_viewer.render())
+        else:
+            # If no logs, just split main into progress and stats directly
+            main_layout.split_row(
+                Layout(name="progress", ratio=2),
+                Layout(name="stats", ratio=1)
+            )
+            
+            # Add progress and stats panels
+            main_layout["progress"].update(
+                Panel(self.progress, title="Operation Progress", border_style="green")
+            )
+            
+            # Create empty stats panel - will be populated later
+            main_layout["stats"].update(
+                Panel(Text("Waiting for operation to start..."), title="Operation Statistics", border_style="cyan")
+            )
+        
+        # Footer with info
+        footer_text = Text("Press Ctrl+C to cancel | Console logs shown below", style="italic")
+        footer_text.justify = "center"
+        layout["footer"].update(Panel(footer_text))
         
         return layout
     
@@ -179,32 +203,62 @@ class RichASCIIInterface:
         """Update the stats panel with current operation statistics."""
         if not self.progress_layout:
             return
-            
-        # Determine the correct path to the stats panel
-        stats_panel_path = "main.stats" if not self.show_logs else "main.upper_main.stats"
-        if stats_panel_path not in self.progress_layout:
-            return
-            
-        stats_table = Table(box=box.ROUNDED, show_header=False, expand=True, highlight=True)
-        stats_table.add_column("Key", style="cyan")
-        stats_table.add_column("Value", style="yellow")
         
-        for key, value in stats.items():
-            # Format the value based on type
-            if isinstance(value, (int, float)) and key.endswith("_size"):
-                # Format size values
-                value = self._format_size(value)
-            elif isinstance(value, float) and key.endswith("_time"):
-                # Format time values
-                value = self._format_time(value)
+        try:
+            # Create stats table
+            stats_table = Table(box=box.ROUNDED, show_header=False, expand=True, highlight=True)
+            stats_table.add_column("Key", style="cyan")
+            stats_table.add_column("Value", style="yellow")
+            
+            for key, value in stats.items():
+                # Format the value based on type
+                if isinstance(value, (int, float)) and key.endswith("_size"):
+                    # Format size values
+                    value = self._format_size(value)
+                elif isinstance(value, float) and key.endswith("_time"):
+                    # Format time values
+                    value = self._format_time(value)
+                    
+                stats_table.add_row(key.replace("_", " ").title(), str(value))
+            
+            # Directly use a more specific path to update the stats panel
+            if self.show_logs and "main" in self.progress_layout:
+                if "upper_main" in self.progress_layout["main"]:
+                    if "stats" in self.progress_layout["main"]["upper_main"]:
+                        self.progress_layout["main"]["upper_main"]["stats"].update(
+                            Panel(stats_table, title="Operation Statistics", border_style="cyan")
+                        )
+            elif "main" in self.progress_layout:
+                if "stats" in self.progress_layout["main"]:
+                    self.progress_layout["main"]["stats"].update(
+                        Panel(stats_table, title="Operation Statistics", border_style="cyan")
+                    )
+            
+            # Update logs if enabled
+            if self.show_logs and "main" in self.progress_layout and "logs" in self.progress_layout["main"]:
+                self.progress_layout["main"]["logs"].update(self.log_viewer.render())
                 
-            stats_table.add_row(key.replace("_", " ").title(), str(value))
-            
-        self.progress_layout[stats_panel_path].update(Panel(stats_table, title="Operation Statistics", border_style="cyan"))
-        
-        # Update logs if enabled
-        if self.show_logs and "main.logs" in self.progress_layout:
-            self.progress_layout["main.logs"].update(self.log_viewer.render())
+        except Exception as e:
+            # If we can't update the stats panel, log the error but don't crash
+            self.logger.warning(f"Error updating stats panel: {str(e)}")
+            # We still want to continue with the program even if the UI has issues
+    
+    def _bring_to_foreground(self):
+        """Bring the console window to the foreground."""
+        try:
+            if sys.platform == "win32":
+                # Get the console window handle
+                hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+                if hwnd:
+                    # Bring window to foreground and set as active
+                    ctypes.windll.user32.SetForegroundWindow(hwnd)
+                    # Ensure window is not minimized
+                    ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE = 9
+            else:
+                # For Linux/Mac, we could potentially use other methods
+                pass
+        except Exception as e:
+            logger.warning(f"Failed to bring window to foreground: {e}")
     
     def display_progress(self, stats: ProgressStats) -> None:
         """Display progress information in Rich ASCII format."""
@@ -242,35 +296,27 @@ class RichASCIIInterface:
                     speed="0"
                 )
                 self.active_progress = True
+            
+            # Ensure we have a valid task_id before updating progress
+            if self.task_id is not None:
+                # Update progress bar
+                speed_str = f"{stats.current_speed:.1f}"
+                self.progress.update(
+                    self.task_id, 
+                    completed=stats.processed_items,
+                    speed=speed_str
+                )
                 
-                # Initialize stats
-                self._update_stats_panel({
-                    "total_items": stats.total_items,
-                    "processed_items": 0,
-                    "progress": "0%",
-                    "current_speed": "0 items/sec",
-                    "start_time": datetime.now().strftime("%H:%M:%S"),
-                    "estimated_time": self._format_time(stats.estimated_time_remaining),
-                    "status": "Running"
-                })
-            
-            # Update the progress 
-            self.progress.update(
-                self.task_id, 
-                completed=stats.processed_items,
-                speed=f"{stats.current_speed:.2f} items"
-            )
-            
-            # Update the stats panel
-            self._update_stats_panel({
-                "total_items": stats.total_items,
-                "processed_items": stats.processed_items,
-                "progress": f"{stats.percentage_complete:.1f}%",
-                "current_speed": f"{stats.current_speed:.2f} items/sec",
-                "start_time": datetime.fromtimestamp(stats.start_time.timestamp()).strftime("%H:%M:%S"),
-                "estimated_time": self._format_time(stats.estimated_time_remaining),
-                "status": "Running" if stats.percentage_complete < 100 else "Complete"
-            })
+                # Update stats panel - only if we have a valid progress_layout
+                if self.progress_layout:
+                    self._update_stats_panel({
+                        "total_items": stats.total_items,
+                        "processed_items": stats.processed_items,
+                        "progress": f"{stats.percentage_complete:.1f}%",
+                        "current_speed": f"{stats.current_speed:.1f} items/sec", 
+                        "elapsed_time": (datetime.now() - stats.start_time).total_seconds(),
+                        "estimated_time_remaining": stats.estimated_time_remaining
+                    })
             
             # Only log to console at certain intervals to avoid overwhelming logs
             if (stats.percentage_complete < 1 or
@@ -297,17 +343,21 @@ class RichASCIIInterface:
     def _log_to_console(self, message):
         """Log a message to the console area at the bottom of the screen."""
         if self.live_display:
-            # Pause the live display temporarily
-            with self.live_display.suspend():
-                # Move cursor to the console area
-                sys.stdout.write(f"\033[{self.terminal_height}B")
-                # Clear the last line
-                sys.stdout.write("\033[K")
-                # Print the message
-                print(message)
-                # Move cursor back to the top
-                sys.stdout.write(f"\033[{self.terminal_height}A")
-                sys.stdout.flush()
+            # Stop the live display temporarily
+            self.live_display.stop()
+            
+            # Move cursor to the console area
+            sys.stdout.write(f"\033[{self.terminal_height}B")
+            # Clear the last line
+            sys.stdout.write("\033[K")
+            # Print the message
+            print(message)
+            # Move cursor back to the top
+            sys.stdout.write(f"\033[{self.terminal_height}A")
+            sys.stdout.flush()
+            
+            # Restart the live display
+            self.live_display.start()
         else:
             # Just log normally if no live display
             print(message)
@@ -315,27 +365,44 @@ class RichASCIIInterface:
     def _finish_progress(self) -> None:
         """Clean up the progress display."""
         if self.active_progress and self.task_id is not None:
-            # Mark the task as complete
-            self.progress.update(self.task_id, completed=self.progress.tasks[self.task_id].total)
-            
-            # Sleep briefly to ensure the UI updates before proceeding
-            time.sleep(0.5)
-            
-            # Stop the live display
-            if self.live_display:
-                self.live_display.stop()
-                self.live_display = None
-            
-            # Stop log monitoring if it was active
-            if self.show_logs:
-                self.log_viewer.stop_monitoring()
-            
-            # Move cursor to a position after the UI
-            sys.stdout.write(f"\033[{self.log_console_lines}B")
-            sys.stdout.flush()
-            
-            self.active_progress = None
-            self.task_id = None
+            try:
+                # Mark the task as complete
+                task = self.progress.tasks.get(self.task_id)
+                if task:
+                    self.progress.update(self.task_id, completed=task.total)
+                    
+                    # Update stats panel to show completion if possible
+                    if self.progress_layout:
+                        self._update_stats_panel({
+                            "total_items": task.total,
+                            "processed_items": task.total,
+                            "progress": "100.0%",
+                            "current_speed": "0.0 items/sec", 
+                            "elapsed_time": task.elapsed,
+                            "estimated_time_remaining": 0.0,
+                            "status": "Completed"
+                        })
+                
+                # Sleep briefly to ensure the UI updates before proceeding
+                time.sleep(0.5)
+            except Exception as e:
+                self.logger.warning(f"Error completing progress: {str(e)}")
+            finally:
+                # Stop the live display
+                if self.live_display:
+                    self.live_display.stop()
+                    self.live_display = None
+                
+                # Stop log monitoring if it was active
+                if self.show_logs:
+                    self.log_viewer.stop_monitoring()
+                
+                # Move cursor to a position after the UI
+                sys.stdout.write(f"\033[{self.log_console_lines}B")
+                sys.stdout.flush()
+                
+                self.active_progress = None
+                self.task_id = None
     
     def display_export_result(self, result: ExportResult) -> None:
         """Display the result of an export operation."""
@@ -374,6 +441,9 @@ class RichASCIIInterface:
     
     def display_export_summary(self, results: List[ExportResult]) -> None:
         """Display a summary of multiple export operations."""
+        # Make sure to properly clean up any active progress display
+        self._finish_progress()
+        
         # Calculate totals
         total_rows = sum(r.rows_exported for r in results)
         total_size = sum(r.file_size for r in results)

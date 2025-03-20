@@ -28,7 +28,8 @@ export:
 
 # Import configuration
 import:
-  input_dir: exports  # Same as export.output_dir by default
+  # Directory containing SQL files to import (default: same as export output-dir)
+  input_dir: exports  
   batch_size: 1000
   compression: false
   parallel_workers: 2  # Use half of available CPU threads
