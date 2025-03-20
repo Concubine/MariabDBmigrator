@@ -35,9 +35,13 @@ pip install -r requirements.txt
 
 ## Visualization Features
 
-The MariaDB Export/Import Tool now includes enhanced terminal visualization through the Rich library:
+The MariaDB Export/Import Tool now includes enhanced terminal visualization options:
 
-- Interactive dashboard-style terminal interface
+- **Rich ASCII Interface**: Dashboard-style terminal interface with color-coded progress bars
+- **Textual TUI Interface**: Modern, interactive TUI interface with improved layout and user experience
+- **Basic ASCII Interface**: Simple, lightweight ASCII visualization for compatibility
+
+Each visualization mode offers:
 - Real-time progress bars with estimated completion time
 - Detailed export/import statistics
 - Color-coded success/error display
@@ -47,6 +51,7 @@ The MariaDB Export/Import Tool now includes enhanced terminal visualization thro
 To select the visualization mode, use the `--ui` parameter:
 
 ```bash
+mariadbexport.exe export --ui textual [options]     # Modern TUI interface
 mariadbexport.exe export --ui rich_ascii [options]  # Enhanced visualization (default)
 mariadbexport.exe export --ui ascii [options]       # Basic ASCII visualization
 ```

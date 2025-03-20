@@ -111,7 +111,7 @@ def parse_args() -> argparse.Namespace:
     export_parser.add_argument("--exclude-data", nargs="+", help="Tables to export without data")
     export_parser.add_argument("--information-schema", action="store_true", help="Export information_schema database")
     export_parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
-    export_parser.add_argument("--ui", choices=["ascii", "rich_ascii"], default="rich_ascii", 
+    export_parser.add_argument("--ui", choices=["ascii", "rich_ascii", "textual"], default="rich_ascii", 
                                help="UI interface to use (default: rich_ascii)")
     # SUGGESTION: Add --dry-run option to show what would be exported without actually exporting
     # SUGGESTION: Add --format option to support different export formats (SQL, CSV, JSON, etc.)
@@ -133,7 +133,7 @@ def parse_args() -> argparse.Namespace:
     import_parser.add_argument("--import-schema", action="store_true", help="Import table schema")
     import_parser.add_argument("--import-data", action="store_true", help="Import table data")
     import_parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
-    import_parser.add_argument("--ui", choices=["ascii", "rich_ascii"], default="rich_ascii", 
+    import_parser.add_argument("--ui", choices=["ascii", "rich_ascii", "textual"], default="rich_ascii", 
                                help="UI interface to use (default: rich_ascii)")
     # SUGGESTION: Add --dry-run option to parse and validate SQL without executing
     # SUGGESTION: Add progress bar option with rich or tqdm libraries
