@@ -222,14 +222,10 @@ class ExportService:
                     f.write(f"{complete_metadata.schema};\n\n")
                     
                     # Write additional metadata like indexes, foreign keys, etc.
-                    if complete_metadata.indexes and not self.config.exclude_indexes:
-                        f.write(f"-- Indexes for table {table}\n")
-                        for index in complete_metadata.indexes:
-                            if index.get('name') != 'PRIMARY':  # Skip primary key index as it's part of CREATE TABLE
-                                columns = ', '.join([f"`{col}`" for col in index.get('columns', [])])
-                                f.write(f"CREATE INDEX `{index.get('name')}` ON `{table}` ({columns});\n")
-                        f.write("\n")
-                        
+                    # Note: Skip writing separate CREATE INDEX statements since they're already in the table schema
+                    # obtained from SHOW CREATE TABLE
+                    
+                    # Only write constraints that aren't indexes
                     if complete_metadata.constraints and not self.config.exclude_constraints:
                         f.write(f"-- Constraints for table {table}\n")
                         for constraint in complete_metadata.constraints:
@@ -354,13 +350,8 @@ class ExportService:
                         f.write(f"INSERT INTO {table} VALUES ({', '.join(values)});\n")
                     f.write("\n")
             
-            # Write indexes if not excluded
-            if not self.config.exclude_indexes and metadata.indexes:
-                with open(output_file, 'a', encoding='utf-8') as f:
-                    f.write(f"-- Indexes for table {table}\n")
-                    for index in metadata.indexes:
-                        f.write(f"CREATE INDEX {index['name']} ON {table} ({', '.join(index['columns'])});\n")
-                    f.write("\n")
+            # Note: Skip writing separate CREATE INDEX statements since they're already in the table schema
+            # obtained from SHOW CREATE TABLE
             
             # Write constraints if not excluded
             if not self.config.exclude_constraints and metadata.constraints:

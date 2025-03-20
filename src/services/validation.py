@@ -21,8 +21,7 @@ class MetadataValidator:
         'foreign_keys': [],
         'indexes': [],
         'constraints': [],
-        'schema': None,
-        'definition': '',  # This is the missing key that caused the original error
+        'schema': None,  # Only keep schema field as it's used everywhere
     }
     
     def validate_table_metadata(self, metadata: Dict[str, Any], table_name: Optional[str] = None) -> Dict[str, Any]:
@@ -55,9 +54,9 @@ class MetadataValidator:
         # Update with provided values
         complete_metadata.update(metadata)
         
-        # Ensure definition exists
-        if not complete_metadata['definition'] and complete_metadata.get('schema'):
-            complete_metadata['definition'] = complete_metadata['schema']
+        # For backward compatibility, ensure definition is available if passed
+        if 'definition' in metadata and metadata['definition'] and not complete_metadata['schema']:
+            complete_metadata['schema'] = metadata['definition']
         
         # Enhance metadata with any missing but required elements
         self._enhance_table_metadata(complete_metadata)
@@ -68,8 +67,8 @@ class MetadataValidator:
         """Ensure all required metadata fields are present and populated."""
         table_name = metadata['name']
         
-        # Ensure definition exists
-        if not metadata['definition'] or not metadata['schema']:
+        # Ensure schema exists
+        if not metadata['schema']:
             try:
                 create_statement = self.db_connection.execute_query(
                     f"SHOW CREATE TABLE `{table_name}`")
@@ -77,8 +76,7 @@ class MetadataValidator:
                     # SHOW CREATE TABLE typically returns a tuple with (table_name, create_statement)
                     create_sql = create_statement[0].get('Create Table') if isinstance(create_statement[0], dict) else create_statement[0][1]
                     
-                    # Update both fields
-                    metadata['definition'] = create_sql
+                    # Update schema
                     metadata['schema'] = create_sql
             except Exception as e:
                 logger.warning(f"Could not retrieve CREATE statement for {table_name}: {e}")
@@ -109,8 +107,8 @@ class MetadataValidator:
             except Exception as e:
                 logger.warning(f"Could not retrieve primary key for {table_name}: {e}")
         
-        # If we still have no definition but have columns, attempt to create a simple CREATE TABLE statement
-        if not metadata['definition'] and metadata['columns']:
+        # If we still have no schema but have columns, attempt to create a simple CREATE TABLE statement
+        if not metadata['schema'] and metadata['columns']:
             try:
                 column_info = self.db_connection.execute_query(
                     f"SHOW COLUMNS FROM `{table_name}`")
@@ -136,7 +134,6 @@ class MetadataValidator:
                     
                     # Construct CREATE TABLE statement
                     create_sql = f"CREATE TABLE `{table_name}` (\n  " + ",\n  ".join(col_defs) + "\n);"
-                    metadata['definition'] = create_sql
                     metadata['schema'] = create_sql
             except Exception as e:
                 logger.warning(f"Could not construct CREATE TABLE statement for {table_name}: {e}")
@@ -163,5 +160,6 @@ class MetadataValidator:
             foreign_keys=complete_metadata['foreign_keys'],
             indexes=complete_metadata['indexes'],
             constraints=complete_metadata['constraints'],
-            schema=complete_metadata['schema'] or complete_metadata['definition']
+            schema=complete_metadata['schema'],
+            definition=complete_metadata['schema']  # For backward compatibility
         ) 

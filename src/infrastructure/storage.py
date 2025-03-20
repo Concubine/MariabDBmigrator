@@ -23,8 +23,7 @@ class SQLStorage(StorageInterface):
         'foreign_keys': [],
         'indexes': [],
         'constraints': [],
-        'schema': None,
-        'definition': '',  # This is the field that was missing
+        'schema': None,  # Only need schema field as it's used everywhere
     }
     
     def save_data(
@@ -209,17 +208,13 @@ class SQLStorage(StorageInterface):
             for field in missing_fields:
                 metadata_dict[field] = self.EXPECTED_TABLE_METADATA[field]
                 
-            # If we have schema but no definition, use schema as definition
-            if metadata_dict.get('schema') and not metadata_dict.get('definition'):
-                metadata_dict['definition'] = metadata_dict['schema']
-                
-            # If we have definition but no schema, use definition as schema
-            if metadata_dict.get('definition') and not metadata_dict.get('schema'):
-                metadata_dict['schema'] = metadata_dict['definition']
+            # For backward compatibility, handle definition field
+            if hasattr(metadata, 'definition') and metadata.definition and not metadata_dict.get('schema'):
+                metadata_dict['schema'] = metadata.definition
             
-            # Use direct schema or definition if available
-            if metadata_dict.get('schema') or metadata_dict.get('definition'):
-                schema = metadata_dict.get('schema') or metadata_dict.get('definition')
+            # Use schema if available
+            if metadata_dict.get('schema'):
+                schema = metadata_dict['schema']
                 self.save_schema(schema, file_path, compression=False)
                 return
                 
@@ -260,7 +255,7 @@ class SQLStorage(StorageInterface):
             
             # Save schema
             self.save_schema(schema, file_path, compression=False)
-            
+                
         except Exception as e:
             logger.error(f"Failed to write schema for {metadata.name}: {str(e)}", exc_info=True)
             raise StorageError(f"Failed to write schema: {str(e)}") 

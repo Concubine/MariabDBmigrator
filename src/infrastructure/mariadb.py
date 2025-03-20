@@ -844,7 +844,7 @@ class MariaDB(DatabaseInterface):
             create_table_info = self._cursor.fetchone()
             schema = create_table_info['Create Table']
             
-            # Return TableMetadata with both schema and definition fields
+            # Return TableMetadata with schema field (definition included for backward compatibility)
             return TableMetadata(
                 name=table_name,
                 columns=column_names,
@@ -853,7 +853,7 @@ class MariaDB(DatabaseInterface):
                 indexes=indexes,
                 constraints=constraints,
                 schema=schema,
-                definition=schema  # Include definition field with the same content as schema
+                definition=schema  # Keep for backward compatibility
             )
             
         except Error as e:
