@@ -1,9 +1,9 @@
 # Database configuration
 database:
   host: localhost
-  port: 3306
+  port: 3333
   user: root
-  password: "rootpassword"
+  password: "1qaz2wsx"
   database: ""
   use_pure: false #Uses the pure Python implementation (MySQLConnection)
   auth_plugin: mysql_native_password  # MySQL authentication plugin to use
@@ -19,7 +19,7 @@ export:
   output_dir: exports
   batch_size: 1000
   compression: false
-  parallel_workers: $MAX_CPU_THREADS/2  # Use half of available CPU threads
+  parallel_workers: 2  # Use half of available CPU threads
   tables: []  # Empty list means all tables
   where: ""  # Empty string means no WHERE clause
   exclude_schema: false
@@ -31,7 +31,7 @@ import:
   input_dir: exports  # Same as export.output_dir by default
   batch_size: 1000
   compression: false
-  parallel_workers: $MAX_CPU_THREADS/2  # Use half of available CPU threads
+  parallel_workers: 2  # Use half of available CPU threads
   mode: skip  # Options: skip, overwrite, merge, cancel
   database: ""
   exclude_schema: false
@@ -45,6 +45,6 @@ logging:
   # Verbosity level: DEBUG, INFO, WARNING, ERROR, CRITICAL
   level: INFO
   # Log file path (leave empty for console output only)
-  file: ""
+  file: "LoggerOutput.log"
   # Log format (default is standard logging format)
   format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s" 

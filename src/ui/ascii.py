@@ -6,7 +6,7 @@ from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
 
-from ..domain.models import ExportResult, ExportFormat
+from ..domain.models import ExportResult
 from ..ui.progress import ProgressStats
 from ..core.logging import get_logger
 
@@ -20,33 +20,55 @@ class ASCIIInterface:
     
     def display_progress(self, stats: ProgressStats) -> None:
         """Display progress information in ASCII format."""
-        # Clear the current line
-        sys.stdout.write('\r' + ' ' * 80 + '\r')
-        
-        # Create progress bar
-        bar_length = 50
-        filled_length = int(bar_length * stats.percentage_complete / 100)
-        bar = '=' * filled_length + '-' * (bar_length - filled_length)
-        
-        # Format time remaining
-        if stats.estimated_time_remaining > 0:
-            time_remaining = self._format_time(stats.estimated_time_remaining)
-        else:
-            time_remaining = "calculating..."
-        
-        # Format speed
-        speed = f"{stats.current_speed:.2f} items/s"
-        
-        # Create status line
-        status = (
-            f"Progress: [{bar}] {stats.percentage_complete:.1f}% | "
-            f"Processed: {stats.processed_items}/{stats.total_items} | "
-            f"Speed: {speed} | "
-            f"ETA: {time_remaining}"
-        )
-        
-        sys.stdout.write(status)
-        sys.stdout.flush()
+        try:
+            # Clear the current line
+            sys.stdout.write('\r' + ' ' * 80 + '\r')
+            
+            # Create progress bar
+            bar_length = 50
+            filled_length = int(bar_length * stats.percentage_complete / 100)
+            bar = '=' * filled_length + '-' * (bar_length - filled_length)
+            
+            # Format time remaining
+            if stats.estimated_time_remaining > 0:
+                time_remaining = self._format_time(stats.estimated_time_remaining)
+            else:
+                time_remaining = "calculating..."
+            
+            # Format speed
+            speed = f"{stats.current_speed:.2f} items/s"
+            
+            # Create status line - make it shorter so it fits better on narrower terminals
+            status = (
+                f"Progress: [{bar}] {stats.percentage_complete:.1f}% | "
+                f"{stats.processed_items}/{stats.total_items} | "
+                f"ETA: {time_remaining}"
+            )
+            
+            # Only log to console at certain intervals to avoid overwhelming logs
+            if (stats.percentage_complete < 1 or
+                stats.percentage_complete > 99 or
+                stats.percentage_complete % 10 < 0.5):  # Log at 0%, 10%, 20%... and >99%
+                self.logger.info(
+                    f"Progress: {stats.percentage_complete:.1f}% | "
+                    f"Processed: {stats.processed_items}/{stats.total_items} | "
+                    f"Speed: {speed} | "
+                    f"ETA: {time_remaining}"
+                )
+            
+            # Always write to stdout
+            sys.stdout.write(status)
+            sys.stdout.flush()
+            
+        except Exception as e:
+            # If display fails, log the error and continue
+            self.logger.error(f"Failed to display progress: {str(e)}")
+            # Try a simpler approach
+            try:
+                sys.stdout.write(f"\rProgress: {stats.percentage_complete:.1f}%")
+                sys.stdout.flush()
+            except:
+                pass
     
     def display_export_result(self, result: ExportResult) -> None:
         """Display the result of an export operation."""

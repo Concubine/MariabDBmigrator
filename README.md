@@ -13,6 +13,7 @@ A high-performance parallel tool for exporting and importing MariaDB databases.
 - Compression support
 - Configurable export/import modes
 - Verbose logging options
+- Enhanced visualization with Rich terminal interface
 
 ## Requirements
 - Python 3.12+
@@ -31,6 +32,24 @@ git clone [repository-url]
 pip install -r requirements.txt
 ```
 
+## Visualization Features
+
+The MariaDB Export/Import Tool now includes enhanced terminal visualization through the Rich library:
+
+- Interactive dashboard-style terminal interface
+- Real-time progress bars with estimated completion time
+- Detailed export/import statistics
+- Color-coded success/error display
+- Comprehensive table results view
+- Consolidated log display
+
+To select the visualization mode, use the `--ui` parameter:
+
+```bash
+mariadbexport.exe export --ui rich_ascii [options]  # Enhanced visualization (default)
+mariadbexport.exe export --ui ascii [options]       # Basic ASCII visualization
+```
+
 ## Usage
 
 ### Export
@@ -45,6 +64,7 @@ Options:
   --tables            Specific tables to export (comma-separated)
   --exclude-tables    Tables to exclude from export (comma-separated)
   --where             WHERE clause for filtering data
+  --ui                UI interface to use: ascii or rich_ascii (default: rich_ascii)
 ```
 
 ### Import

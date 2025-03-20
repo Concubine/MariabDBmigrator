@@ -80,14 +80,24 @@ class ImportOptions:
 class ExportResult:
     """Result of an export operation."""
     table_name: str
-    total_rows: int
+    success: bool = True
+    rows_exported: int = 0
+    file_path: Optional[str] = None
+    file_size: int = 0
+    duration: float = 0.0
+    error_message: Optional[str] = None
     schema_file: Optional[Path] = None
     data_file: Optional[Path] = None
+    total_rows: int = 0  # For backward compatibility
 
 @dataclass
 class ImportResult:
     """Result of an import operation."""
     table_name: str
     status: str
-    total_rows: int = 0
+    success: bool = True
+    rows_imported: int = 0
+    total_rows: int = 0  # For backward compatibility
+    file_path: Optional[str] = None
+    duration: float = 0.0
     error_message: Optional[str] = None 

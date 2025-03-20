@@ -3,7 +3,7 @@ import logging
 import time
 import os
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Any
 import re
 import sqlparse
 
@@ -14,6 +14,7 @@ from src.domain.models import ImportResult, ImportMode
 from src.infrastructure.mariadb import MariaDB
 from src.infrastructure.storage import SQLStorage
 from src.infrastructure.parallel import ParallelWorker, WorkerConfig
+from src.ui.progress import ProgressTracker, ProgressStats
 
 # SUGGESTION: Add support for different input formats (CSV, JSON, Parquet)
 # SUGGESTION: Implement data validation with checksums during import
@@ -23,13 +24,14 @@ logger = get_logger(__name__)
 class ImportService:
     """Service for importing database tables."""
     
-    def __init__(self, database: DatabaseConfig, files: List[str], config: ImportConfig):
+    def __init__(self, database: DatabaseConfig, files: List[str], config: ImportConfig, ui_interface: Any = None):
         """Initialize the import service.
         
         Args:
             database: Database configuration
             files: List of SQL files to import
             config: Import configuration
+            ui_interface: UI interface for progress and results
         """
         # SUGGESTION: Add option for data transformation/filtering pipeline
         # SUGGESTION: Support target table name mapping for importing to different table structures
@@ -42,6 +44,7 @@ class ImportService:
         self.files_processed = 0
         self.total_statements = 0
         self.statements_processed = 0
+        self.ui = ui_interface
         
     def import_data(self) -> List[ImportResult]:
         """Import tables into the database.
@@ -66,240 +69,107 @@ class ImportService:
             # Track failed constraints to retry later
             self.failed_constraints = []
             
-            # First check if a database name was specified in the import config
+            # If a specific database is specified for import, select it
             if self.config.database:
-                logger.info(f"Using database name from import configuration: {self.config.database}")
-                self.database.database = self.config.database
-            # Then check if database is specified in database configuration
-            elif not self.database.database:
-                logger.info("No target database specified in configuration. Attempting to extract from SQL files...")
-                
-                # Initialize target database variable
-                target_database = None
-                
-                # First check if there are any database schema files
-                schema_files = [f for f in self.files if f.endswith('_schema.sql')]
-                if schema_files:
-                    logger.info(f"Found database schema files: {', '.join(schema_files)}")
-                    for schema_file in schema_files:
-                        try:
-                            with open(Path(schema_file), 'r', encoding='utf-8') as f:
-                                content = f.read()
-                                # Extract database name from schema file
-                                # SUGGESTION: Use more robust SQL parsing instead of regex
-                                db_match = re.search(r'--\s*Database:\s*([^\s\r\n]+)', content, re.IGNORECASE)
-                                if db_match:
-                                    target_database = db_match.group(1)
-                                    logger.info(f"Found database name in schema file: {target_database}")
-                                    break
-                        except Exception as e:
-                            logger.warning(f"Error reading schema file {schema_file}: {str(e)}")
-                            continue
-                
-                # If no schema file found, try to extract from regular SQL files
-                if not target_database:
-                    for file_path in self.files:
-                        try:
-                            # Read the first few lines of the SQL file to look for database name
-                            with open(Path(file_path), 'r', encoding='utf-8') as f:
-                                content = ''.join(f.readline() for _ in range(20))  # Read first 20 lines
-                                
-                                # Look for CREATE DATABASE or USE statements
-                                # SUGGESTION: Use sqlparse library for more robust SQL parsing
-                                db_match = re.search(r'CREATE\s+DATABASE\s+(?:IF\s+NOT\s+EXISTS\s+)?[`"]?([^`"\s;]+)[`"]?', content, re.IGNORECASE)
-                                if not db_match:
-                                    # Updated regex to properly handle quoted database names and avoid including trailing punctuation
-                                    db_match = re.search(r'USE\s+`([^`]+)`|USE\s+"([^"]+)"|USE\s+([^\s;,\'"`]+)', content, re.IGNORECASE)
-                                    if db_match:
-                                        # Get the first non-None capture group
-                                        target_database = next(group for group in db_match.groups() if group is not None)
-                                
-                                # Look for special comment with database name (added by our export process)
-                                if not db_match:
-                                    db_match = re.search(r'--\s*Database:\s*([^\s\r\n]+)', content, re.IGNORECASE)
-                                    if db_match:
-                                        target_database = db_match.group(1)
-                                        logger.info(f"Found database name in comment: {target_database}")
-                                
-                                # Look for table creation with database specified
-                                if not db_match:
-                                    db_match = re.search(r'CREATE\s+TABLE\s+(?:`([^`]+)`|"([^"]+)"|([^\s.`"]+))\.', content, re.IGNORECASE)
-                                    if db_match:
-                                        # Get the first non-None capture group
-                                        target_database = next(group for group in db_match.groups() if group is not None)
-                                        
-                                # Check for comment that might include database name
-                                if not db_match:
-                                    db_match = re.search(r'--\s*(?:Database|DB):\s*[`"]?([^`"\r\n]+)[`"]?', content, re.IGNORECASE)
-                                
-                                if db_match and not target_database:
-                                    target_database = db_match.group(1)
-                                    logger.info(f"Found database name in SQL file: {target_database}")
-                                    break
-                        except Exception as e:
-                            logger.warning(f"Error reading SQL file {file_path}: {str(e)}")
-                            continue
-                
-                # If still no database found, use a default name
-                if not target_database:
-                    # Instead of using a hardcoded default name, check for database name in configuration
-                    if self.database.database:
-                        target_database = self.database.database
-                        logger.info(f"Using database name from configuration: {target_database}")
-                    else:
-                        # Use the original name if specified in file, otherwise fall back to default
-                        # SUGGESTION: Allow configuring default database name
-                        target_database = "imported_db" 
-                        logger.info(f"No database found in SQL files or configuration. Using default name: {target_database}")
-                    
-                # Update the database config
-                self.database.database = target_database
+                logger.info(f"Selecting database: {self.config.database}")
+                self.db.select_database(self.config.database)
             
-            # Check if database exists and create it if not
-            available_dbs = self.db.get_available_databases()
-            if self.database.database not in available_dbs:
-                logger.info(f"Database '{self.database.database}' does not exist. Creating it.")
-                self.db.execute(f"CREATE DATABASE IF NOT EXISTS `{self.database.database}`")
-            
-            # Select the database
-            self.db.select_database(self.database.database)
-            logger.info(f"Using database '{self.database.database}' for import")
-            
-            # Disable foreign key checks globally if configured
-            # SUGGESTION: Add option to selectively disable foreign keys only for specific tables
+            # Disable foreign key checks if configured
             foreign_keys_disabled = False
             if self.config.disable_foreign_keys:
-                logger.info("Disabling foreign key checks globally for import process")
-                self.db.execute("SET FOREIGN_KEY_CHECKS=0")
-                foreign_keys_disabled = True
+                logger.info("Disabling foreign key checks for import")
+                try:
+                    self.db.execute("SET FOREIGN_KEY_CHECKS=0")
+                    foreign_keys_disabled = True
+                except Exception as e:
+                    logger.warning(f"Error disabling foreign key checks: {str(e)}")
             
-            try:
-                # Import each file
-                results = []
+            # Import files
+            results = []
+            total_files = len(self.files)
+            
+            # Create progress tracker for files
+            tracker = None
+            if self.ui and hasattr(self.ui, 'display_progress'):
+                tracker = ProgressTracker(
+                    total_items=total_files,
+                    update_callback=self.ui.display_progress
+                )
+            
+            # Process each file
+            for i, file_path in enumerate(self.files, 1):
+                elapsed = time.time() - self.start_time
                 
-                # Sort files to ensure schema files are processed before data files
-                # SUGGESTION: Move file sorting logic to a separate method for better maintainability
-                def file_sort_key(file_path):
-                    """Sort key function for import files.
-                    
-                    Priority (lowest to highest):
-                    1. Database schema files (lowest priority, process first)
-                    2. Data files containing INSERT statements
-                    """
-                    path = Path(file_path)
-                    
-                    # Schema files first
-                    if path.name.endswith('_schema.sql'):
-                        return 0
-                    # Data files last
-                    elif path.name.endswith('_data.sql'):
-                        return 1
-                    
-                    # For more accurate categorization, peek into file content
+                # Log progress
+                if i > 1:
+                    # Calculate progress statistics
+                    progress_percent = (i - 1) / total_files * 100
+                    estimated_total = elapsed / (i - 1) * total_files
+                    remaining = estimated_total - elapsed
+                    logger.info(
+                        f"Progress: {i-1}/{total_files} files processed ({progress_percent:.1f}%). "
+                        f"Estimated time remaining: {self._format_time(remaining)}"
+                    )
+                
+                # Import file
+                logger.info(f"Importing file {i}/{total_files}: {file_path}")
+                result = self._import_file(Path(file_path))
+                results.append(result)
+                self.files_processed += 1
+                
+                # Update progress
+                if tracker:
+                    tracker.update(i)
+                
+                # Display result in UI if available
+                if self.ui and hasattr(self.ui, 'display_import_result'):
+                    self.ui.display_import_result(result)
+                
+            # Retry any failed constraints at the end
+            # SUGGESTION: Implement more sophisticated constraint dependency resolution
+            if self.failed_constraints:
+                logger.info(f"Attempting to apply {len(self.failed_constraints)} failed constraints")
+                successful_constraints = 0
+                
+                for constraint in self.failed_constraints:
                     try:
-                        with open(path, 'r', encoding='utf-8') as f:
-                            # Read a sample of the file to determine type
-                            sample = ''.join(f.readline() for _ in range(10))
-                            
-                            # Check for CREATE TABLE statements
-                            if re.search(r'CREATE\s+TABLE', sample, re.IGNORECASE):
-                                return 0  # Schema files first
-                            
-                            # Check for INSERT statements
-                            if re.search(r'INSERT\s+INTO', sample, re.IGNORECASE):
-                                return 1  # Data files last
+                        self.db.execute(constraint)
+                        successful_constraints += 1
                     except Exception as e:
-                        logger.warning(f"Error reading file {path} for sorting: {str(e)}")
-                    
-                    # Default to middle priority if can't determine
-                    return 0.5  # Between schema and data
+                        logger.warning(f"Failed to apply constraint: {str(e)}\nConstraint: {constraint}")
                 
-                # Sort the files to process schema files first
-                sorted_files = sorted(self.files, key=file_sort_key)
-                
-                # Count total statements in all files for progress tracking
-                # SUGGESTION: Make this count optional with a flag for faster startup with large files
-                self.total_statements = self._count_statements_in_files(sorted_files)
-                logger.info(f"Found {self.total_statements} SQL statements to process in {len(sorted_files)} files")
-                
-                # Process each file
-                file_count = len(sorted_files)
-                for i, file_path in enumerate(sorted_files, 1):
-                    # SUGGESTION: Add progress callback for UI integration
-                    logger.info(f"Processing file {i}/{file_count}: {Path(file_path).name}")
-                    
-                    # Display progress estimation
-                    if i > 1:
-                        elapsed = time.time() - self.start_time
-                        progress_factor = max(0.25, (i-1)/file_count)  # Start at 0.25 (4x) and approach 1.0
-                        estimated_total = (elapsed / ((i-1) * progress_factor)) * file_count
-                        remaining = estimated_total - elapsed
-                        logger.info(f"Progress: {((i-1)/file_count)*100:.1f}% ({i-1}/{file_count} files). Estimated time remaining: {self._format_time(remaining)}")
-                    
-                    try:
-                        # Import the file
-                        result = self._import_file(Path(file_path))
-                        results.append(result)
-                        self.files_processed += 1
-                    except Exception as e:
-                        logger.error(f"Error processing file {file_path}: {str(e)}")
-                        # Add a failed result
-                        results.append(ImportResult(
-                            table_name=Path(file_path).stem,
-                            status="ERROR",
-                            error_message=str(e)
-                        ))
-                        
-                        # Re-raise if not configured to continue on error
-                        if not self.config.continue_on_error:
-                            raise ImportError(f"Import failed: {str(e)}")
-                
-                # Retry any failed constraints at the end
-                # SUGGESTION: Implement more sophisticated constraint dependency resolution
-                if self.failed_constraints:
-                    logger.info(f"Attempting to apply {len(self.failed_constraints)} failed constraints")
-                    successful_constraints = 0
-                    
-                    for constraint in self.failed_constraints:
-                        try:
-                            self.db.execute(constraint)
-                            successful_constraints += 1
-                        except Exception as e:
-                            logger.warning(f"Failed to apply constraint: {str(e)}\nConstraint: {constraint}")
-                    
-                    logger.info(f"Successfully applied {successful_constraints}/{len(self.failed_constraints)} previously failed constraints")
-                
-                # Display statistics
-                total_time = time.time() - self.start_time
-                logger.info(f"Import completed in {self._format_time(total_time)}")
-                logger.info(f"Processed {self.files_processed} files with {self.statements_processed} SQL statements")
-                
-                return results
-                
-            finally:
-                # Re-enable foreign key checks if they were disabled
-                if foreign_keys_disabled:
-                    logger.info("Re-enabling foreign key checks")
-                    try:
-                        self.db.execute("SET FOREIGN_KEY_CHECKS=1")
-                    except Exception as e:
-                        logger.warning(f"Error re-enabling foreign key checks: {str(e)}")
-        
+                logger.info(f"Successfully applied {successful_constraints}/{len(self.failed_constraints)} previously failed constraints")
+            
+            # Display statistics
+            total_time = time.time() - self.start_time
+            logger.info(f"Import completed in {self._format_time(total_time)}")
+            logger.info(f"Processed {self.files_processed} files with {self.statements_processed} SQL statements")
+            
+            # Complete progress
+            if tracker:
+                tracker.complete()
+            
+            # Display summary in UI if available
+            if self.ui and hasattr(self.ui, 'display_import_summary'):
+                self.ui.display_import_summary(results)
+            
+            return results
+            
         except Exception as e:
             raise ImportError(f"Import failed: {str(e)}")
             
         finally:
+            # Re-enable foreign key checks if they were disabled
+            if foreign_keys_disabled:
+                logger.info("Re-enabling foreign key checks")
+                try:
+                    self.db.execute("SET FOREIGN_KEY_CHECKS=1")
+                except Exception as e:
+                    logger.warning(f"Error re-enabling foreign key checks: {str(e)}")
             self.db.disconnect()
-    
-    def _format_time(self, seconds: float) -> str:
-        """Format time in seconds to a human-readable string.
-        
-        Args:
-            seconds: Time in seconds
             
-        Returns:
-            Formatted time string
-        """
+    def _format_time(self, seconds: float) -> str:
+        """Format time in seconds to a human-readable string."""
         if seconds < 60:
             return f"{seconds:.1f} seconds"
         elif seconds < 3600:
@@ -368,7 +238,7 @@ class ImportService:
                     self.database.database = database_name
             else:
                 # Extract table name from CREATE TABLE statement if present
-                create_table_match = re.search(r'CREATE\s+TABLE\s+(?:`?([^`\s\.]+)`?\.)?`?([^`\s]+)`?', sql_content, re.IGNORECASE)
+                create_table_match = re.search(r'CREATE\s+TABLE\s+(?:`([^`\s\.]+)`?\.)?`?([^`\s]+)`?', sql_content, re.IGNORECASE)
                 
                 if create_table_match:
                     # Group 1 is the database name (if present), group 2 is the table name

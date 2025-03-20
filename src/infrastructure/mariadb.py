@@ -1170,4 +1170,31 @@ class MariaDB(DatabaseInterface):
             # Update the database name in config
             self.config['database'] = database
         except Error as e:
-            raise DatabaseError(f"Failed to select database {database}: {str(e)}") 
+            raise DatabaseError(f"Failed to select database {database}: {str(e)}")
+
+    def get_row_count(self, table_name: str, where_clause: Optional[str] = None) -> int:
+        """Get the number of rows in a table.
+        
+        Args:
+            table_name: Table name
+            where_clause: Optional WHERE clause
+            
+        Returns:
+            Number of rows
+        """
+        try:
+            self._ensure_connected()
+            
+            # Construct query with optional WHERE clause
+            query = f"SELECT COUNT(*) as count FROM `{table_name}`"
+            if where_clause:
+                query += f" WHERE {where_clause}"
+                
+            # Execute query
+            self._cursor.execute(query)
+            result = self._cursor.fetchone()
+            
+            return result['count'] if result else 0
+            
+        except Error as e:
+            raise DatabaseError(f"Failed to get row count for table {table_name}: {str(e)}") 
