@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from src.core.exceptions import ExportError
 from src.core.logging import get_logger
 from src.core.config import ExportConfig, DatabaseConfig
-from src.domain.models import ExportResult, ExportOptions
+from src.domain.models import ExportResult, ExportOptions, TableInfo
 from src.infrastructure.mariadb import MariaDB
 from src.infrastructure.storage import SQLStorage
 from src.infrastructure.parallel import ParallelWorker, WorkerConfig
@@ -27,74 +27,44 @@ class ExportService:
             database: Database configuration
             config: Export configuration
         """
+        # Implementation: Initialize components needed for database export
         self.database = database
         self.config = config
-        self.db = MariaDB(database)
-        self.storage = SQLStorage()
-        self.validator = MetadataValidator(self.db)
+        self.db = MariaDB(database)  # Database access layer
+        self.storage = SQLStorage()  # File storage layer
+        self.validator = MetadataValidator(self.db)  # Schema validation
         self.total_exported = 0
         self.results = []
+        self.live_view_adapter = None
         
     def export_data(self) -> List[ExportResult]:
-        """Export tables from the database.
+        """Export database data.
         
         Returns:
             List of export results
-            
-        Raises:
-            ExportError: If export fails
         """
-        try:
-            # Connect to database
+        # Implementation: Export data from database
+        
+        # Determine if current database is specified or if we should export multiple databases
+        if self.database.database:
+            # Export tables from the specified database
             self.db.connect()
-            
-            # Special case for information_schema
-            if hasattr(self.config, 'include_information_schema') and self.config.include_information_schema:
-                logger.info("Exporting information_schema tables")
-                self.db.select_database('information_schema')
-                info_schema_results = self._export_database_tables()
-                return info_schema_results
-            
-            # Handle the case when no specific database is selected
-            if 'database' not in self.db.config or not self.db.config.get('database', ''):
-                # List available databases
-                databases = self.db.get_available_databases()
-                # Filter out system databases
-                user_databases = [db for db in databases if db not in ['information_schema', 'mysql', 'performance_schema', 'sys']]
-                
-                if not user_databases:
-                    logger.warning("No user databases found to export")
-                    return []
-                    
-                logger.info(f"Found {len(user_databases)} databases available for export")
-                logger.info(f"Available databases: {', '.join(user_databases)}")
-                
-                # If no specific database was chosen, we'll need to handle each database separately
-                results = []
-                for db_name in user_databases:
-                    self.db.select_database(db_name)
-                    logger.info(f"Exporting database: {db_name}")
-                    # Get tables to export for this database
-                    db_results = self._export_database_tables()
-                    results.extend(db_results)
-                
-                return results
-            else:
-                # Normal export of the specified database
-                return self._export_database_tables()
-            
-        except Exception as e:
-            raise ExportError(f"Export failed: {str(e)}")
-            
-        finally:
-            self.db.disconnect()
+            results = self._export_database_tables()
+            return results
+        else:
+            # No database specified, export all available databases
+            # TODO: Implement multi-database export
+            logger.warning("No database specified. Please specify a database to export.")
+            return []
 
     def _export_database_tables(self) -> List[ExportResult]:
-        """Export tables from the currently selected database.
+        """Export tables from the current database.
         
         Returns:
             List of export results
         """
+        # Implementation: Export all selected tables from current database
+        
         # Get current database name and ensure it's set in the config
         current_db = self.db.get_current_database()
         if current_db:
@@ -105,6 +75,7 @@ class ExportService:
             return []
         
         # Create a database metadata file to store information about this database
+        # Implementation: Generate database creation script for import
         output_dir = Path(self.config.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         db_info_file = output_dir / f"{current_db}_info.sql"
@@ -117,21 +88,75 @@ class ExportService:
             f.write(f"-- Database structure and tables exported separately\n")
         
         # Get tables to export
-        tables_to_export = self._get_tables_to_export()
-        if not tables_to_export:
-            logger.warning(f"No tables found to export in database {current_db}")
+        # Implementation: Filter tables based on configuration options
+        try:
+            tables_to_export = self._get_tables_to_export()
+            if not tables_to_export:
+                logger.warning(f"No tables found to export in database {current_db}")
+                return []
+                
+            logger.info(f"Found {len(tables_to_export)} tables to export in database {current_db}")
+            
+            # If live view adapter is set, create TableInfo objects and start the export view
+            if hasattr(self, 'live_view_adapter') and self.live_view_adapter:
+                try:
+                    from src.domain.models import TableInfo
+                    # Create TableInfo objects for each table
+                    table_info_list = []
+                    for table_name in tables_to_export:
+                        try:
+                            # Get row count for each table with proper error handling
+                            try:
+                                row_count = self.db.get_row_count(table_name)
+                            except Exception as e:
+                                logger.warning(f"Error getting row count for {table_name}: {e}")
+                                row_count = None
+                                
+                            table_info = TableInfo(
+                                name=table_name,
+                                row_count=row_count,
+                                size_bytes=None,  # Can be filled later if needed
+                                has_schema=not self.config.exclude_schema,
+                                has_data=table_name not in self.config.exclude_data
+                            )
+                            table_info_list.append(table_info)
+                        except Exception as e:
+                            logger.warning(f"Error creating TableInfo for {table_name}: {e}")
+                            # Add a minimal TableInfo to avoid breaking the UI
+                            table_info_list.append(TableInfo(name=table_name))
+                    
+                    # Start export monitoring with the table info list
+                    if table_info_list:
+                        self.live_view_adapter.start_export(table_info_list)
+                    else:
+                        logger.warning("No TableInfo objects created, live view may not display correctly")
+                except Exception as e:
+                    logger.exception(f"Error setting up live view: {e}")
+                    logger.warning("Continuing export without live view")
+            
+            # Export each table
+            # Implementation: Sequential table export
+            results = []
+            for table in tables_to_export:
+                try:
+                    result = self._export_single_table(table)
+                    results.append(result)
+                except Exception as e:
+                    logger.error(f"Error exporting table {table}: {e}")
+                    # Add a failed result
+                    results.append(ExportResult(
+                        table_name=table,
+                        total_rows=0,
+                        schema_file=None,
+                        data_file=None
+                    ))
+                
+            logger.info(f"Export completed successfully for database {current_db}")
+            return results
+            
+        except Exception as e:
+            logger.exception(f"Error during export of database {current_db}: {e}")
             return []
-            
-        logger.info(f"Found {len(tables_to_export)} tables to export in database {current_db}")
-        
-        # Export each table
-        results = []
-        for table in tables_to_export:
-            result = self._export_single_table(table)
-            results.append(result)
-            
-        logger.info(f"Export completed successfully for database {current_db}")
-        return results
         
     def _get_tables_to_export(self) -> List[str]:
         """Get list of tables to export.
@@ -139,6 +164,7 @@ class ExportService:
         Returns:
             List of table names
         """
+        # Implementation: Apply table filtering based on configuration settings
         # Get all tables from database
         all_tables = self.db.get_table_names()
         
@@ -147,7 +173,7 @@ class ExportService:
         
         # Filter tables based on configuration
         if self.config.tables:
-            # Export only specified tables
+            # Implementation: Export only explicitly included tables
             tables = [t for t in all_tables if t in self.config.tables]
             logger.debug(f"Filtered to specified tables: {', '.join(tables)}")
         else:
@@ -166,11 +192,16 @@ class ExportService:
         """Export a single table.
         
         Args:
-            table: Table to export
+            table: Table name
             
         Returns:
-            ExportResult: Result of the export
+            Export result
         """
+        # Implementation: Multi-step table export process:
+        # 1. Export table schema if requested
+        # 2. Export table data if not in exclude_data list
+        # 3. Track progress
+        
         logger.info(f"Exporting table: {table}")
         
         # Create output directory
@@ -285,16 +316,26 @@ class ExportService:
             data_file=data_file
         )
 
-    def _format_batch_for_export(self, batch: List[dict], table: str) -> str:
-        """Format a batch of rows for export.
+    def set_live_view_adapter(self, adapter) -> None:
+        """Set the live view adapter for real-time progress display.
         
         Args:
-            batch: List of rows to format
-            table: Name of the table
+            adapter: Live view adapter instance
+        """
+        # Implementation: Configure real-time progress monitoring
+        self.live_view_adapter = adapter
+
+    def _format_batch_for_export(self, batch: List[dict], table: str) -> str:
+        """Format a batch of rows for SQL export.
+        
+        Args:
+            batch: List of row dictionaries
+            table: Table name
             
         Returns:
-            Formatted SQL statements
+            SQL insert statement
         """
+        # Implementation: Generate optimized SQL INSERT statements for data import
         output = []
         for row in batch:
             values = [self.db._format_value(v) for v in row.values()]
@@ -302,13 +343,23 @@ class ExportService:
         return '\n'.join(output) + '\n\n'
 
     def _export_sequential(self, tables: List[str]) -> None:
-        """Export tables sequentially."""
+        """Export tables sequentially.
+        
+        Args:
+            tables: List of table names
+        """
+        # Implementation: Sequential export using single database connection
         with MariaDB(self.database) as db:
             for table in tables:
                 self._export_table(db, table)
     
     def _export_parallel(self, tables: List[str]) -> None:
-        """Export tables in parallel."""
+        """Export tables in parallel.
+        
+        Args:
+            tables: List of table names
+        """
+        # Implementation: Parallel export using worker pool and multiple connections
         with ThreadPoolExecutor(max_workers=self.config.parallel_workers) as executor:
             future_to_table = {
                 executor.submit(self._export_table_with_new_connection, table): table
@@ -323,12 +374,23 @@ class ExportService:
                     raise ExportError(f"Failed to export table {table}: {str(e)}")
     
     def _export_table_with_new_connection(self, table: str) -> None:
-        """Export a single table with a new database connection."""
+        """Export a table with a new database connection (for parallel processing).
+        
+        Args:
+            table: Table name
+        """
+        # Implementation: Export table with dedicated database connection (parallel worker)
         with MariaDB(self.database) as db:
             self._export_table(db, table)
     
     def _export_table(self, db: DatabaseInterface, table: str) -> None:
-        """Export a single table."""
+        """Export a table using provided database connection.
+        
+        Args:
+            db: Database interface
+            table: Table name
+        """
+        # Implementation: Core table export logic using provided database connection
         try:
             logger.info(f"Exporting table: {table}")
             

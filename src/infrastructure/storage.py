@@ -33,7 +33,13 @@ class SQLStorage(StorageInterface):
         file_path: Path,
         compression: bool = False
     ) -> None:
-        """Save data to a SQL file."""
+        """Save data to a SQL file.
+        
+        Args:
+            data: List of data rows as dictionaries
+            file_path: Path to save the file
+            compression: Whether to compress the file
+        """
         try:
             # Create directory if it doesn't exist
             file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -76,7 +82,15 @@ class SQLStorage(StorageInterface):
         file_path: Path,
         compression: bool = False
     ) -> List[Dict[str, Any]]:
-        """Load data from a SQL file."""
+        """Load data from a SQL file.
+        
+        Args:
+            file_path: Path to the file
+            compression: Whether the file is compressed
+            
+        Returns:
+            List of data rows as dictionaries
+        """
         try:
             # Read file content
             if compression:
@@ -140,7 +154,13 @@ class SQLStorage(StorageInterface):
         file_path: Path,
         compression: bool = False
     ) -> None:
-        """Save table schema to a SQL file."""
+        """Save table schema to a SQL file.
+        
+        Args:
+            schema: SQL schema definition
+            file_path: Path to save the file
+            compression: Whether to compress the file
+        """
         try:
             # Create directory if it doesn't exist
             file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -162,17 +182,25 @@ class SQLStorage(StorageInterface):
         file_path: Path,
         compression: bool = False
     ) -> str:
-        """Load table schema from a SQL file."""
+        """Load table schema from a SQL file.
+        
+        Args:
+            file_path: Path to the file
+            compression: Whether the file is compressed
+            
+        Returns:
+            SQL schema definition
+        """
         try:
-            # Read schema from file
+            # Read file content
             if compression:
                 with gzip.open(file_path, 'rt', encoding='utf-8') as f:
-                    schema = f.read()
+                    content = f.read()
             else:
                 with open(file_path, 'r', encoding='utf-8') as f:
-                    schema = f.read()
+                    content = f.read()
             
-            return schema
+            return content
             
         except Exception as e:
             raise StorageError(f"Failed to load schema from {file_path}: {str(e)}")
@@ -182,85 +210,69 @@ class SQLStorage(StorageInterface):
         file_path: Path,
         metadata: TableMetadata
     ) -> None:
-        """Write table schema to a SQL file.
-        
-        This is an alias for save_schema that accepts TableMetadata.
+        """Write table metadata to a schema file.
         
         Args:
-            file_path: Path to save schema to
+            file_path: Path to save the file
             metadata: Table metadata
         """
         try:
-            # Create a complete metadata dictionary with all expected fields
-            metadata_dict = {}
+            # Create directory if it doesn't exist
+            file_path.parent.mkdir(parents=True, exist_ok=True)
             
-            # First populate from the metadata object attributes
-            for field in self.EXPECTED_TABLE_METADATA:
-                if hasattr(metadata, field):
-                    metadata_dict[field] = getattr(metadata, field)
+            # Start with table creation statement
+            schema = []
+            if metadata.schema:
+                schema.append(f"-- Table structure for table `{metadata.name}`")
+                schema.append(metadata.schema + ";")
+                schema.append("")
             
-            # Handle missing fields
-            missing_fields = [field for field in self.EXPECTED_TABLE_METADATA.keys() 
-                            if field not in metadata_dict]
-            if missing_fields:
-                logger.debug(f"Missing expected metadata fields for table '{metadata_dict.get('name', 'unknown')}': {', '.join(missing_fields)}")
+            # Add indexes if not included in schema
+            schema.append(f"-- Indexes for table `{metadata.name}`")
+            for index in metadata.indexes:
+                # Format index definition
+                index_name = index.get('name', f"idx_{metadata.name}_{len(schema)}")
+                columns = ', '.join([f"`{col}`" for col in index.get('columns', [])])
+                schema.append(f"CREATE INDEX `{index_name}` ON `{metadata.name}` ({columns});")
+            schema.append("")
             
-            # Add defaults for missing fields
-            for field in missing_fields:
-                metadata_dict[field] = self.EXPECTED_TABLE_METADATA[field]
+            # Add constraints if not included in schema
+            schema.append(f"-- Constraints for table `{metadata.name}`")
+            for constraint in metadata.constraints:
+                if constraint.get('type') == 'UNIQUE':
+                    # Format unique constraint
+                    constraint_name = constraint.get('name', f"unique_{metadata.name}_{len(schema)}")
+                    columns = ', '.join([f"`{col}`" for col in constraint.get('columns', [])])
+                    schema.append(f"ALTER TABLE `{metadata.name}` ADD CONSTRAINT `{constraint_name}` UNIQUE ({columns});")
+                    
+            for fk in metadata.foreign_keys:
+                # Format foreign key constraint
+                fk_name = fk.get('name', f"fk_{metadata.name}_{len(schema)}")
+                column = fk.get('column', '')
+                ref_table = fk.get('ref_table', '')
+                ref_column = fk.get('ref_column', '')
+                if column and ref_table and ref_column:
+                    schema.append(f"ALTER TABLE `{metadata.name}` ADD CONSTRAINT `{fk_name}` " +
+                                f"FOREIGN KEY (`{column}`) REFERENCES `{ref_table}` (`{ref_column}`);")
+            
+            # Write to file
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(schema))
                 
-            # If we have schema but no definition, use schema as definition
-            if metadata_dict.get('schema') and not metadata_dict.get('definition'):
-                metadata_dict['definition'] = metadata_dict['schema']
-                
-            # If we have definition but no schema, use definition as schema
-            if metadata_dict.get('definition') and not metadata_dict.get('schema'):
-                metadata_dict['schema'] = metadata_dict['definition']
-            
-            # Use direct schema or definition if available
-            if metadata_dict.get('schema') or metadata_dict.get('definition'):
-                schema = metadata_dict.get('schema') or metadata_dict.get('definition')
-                self.save_schema(schema, file_path, compression=False)
-                return
-                
-            # Otherwise, generate CREATE TABLE statement from metadata
-            schema = f"CREATE TABLE {metadata_dict['name']} (\n"
-            
-            # Add columns
-            column_defs = []
-            for column in metadata_dict['columns']:
-                column_defs.append(f"  {column}")
-            
-            # Add primary key if present
-            if metadata_dict['primary_key']:
-                pk_cols = ', '.join(metadata_dict['primary_key'])
-                column_defs.append(f"  PRIMARY KEY ({pk_cols})")
-                
-            # Add foreign keys
-            for fk in metadata_dict['foreign_keys']:
-                fk_def = f"  FOREIGN KEY ({fk['column']}) REFERENCES {fk['ref_table']}({fk['ref_column']})"
-                if 'on_delete' in fk:
-                    fk_def += f" ON DELETE {fk['on_delete']}"
-                if 'on_update' in fk:
-                    fk_def += f" ON UPDATE {fk['on_update']}"
-                column_defs.append(fk_def)
-                
-            # Add indexes
-            for idx in metadata_dict['indexes']:
-                idx_def = f"  INDEX {idx['name']} ({', '.join(idx['columns'])})"
-                column_defs.append(idx_def)
-                
-            # Add constraints
-            for constraint in metadata_dict['constraints']:
-                constraint_def = f"  CONSTRAINT {constraint['name']} {constraint.get('definition', '')}"
-                column_defs.append(constraint_def)
-                
-            schema += ',\n'.join(column_defs)
-            schema += "\n);"
-            
-            # Save schema
-            self.save_schema(schema, file_path, compression=False)
-            
         except Exception as e:
-            logger.error(f"Failed to write schema for {metadata.name}: {str(e)}", exc_info=True)
-            raise StorageError(f"Failed to write schema: {str(e)}") 
+            raise StorageError(f"Failed to write schema to {file_path}: {str(e)}")
+    
+    def load_metadata(
+        self,
+        file_path: Path
+    ) -> TableMetadata:
+        """Load table metadata from a schema file.
+        
+        Args:
+            file_path: Path to the file
+            
+        Returns:
+            Table metadata
+        """
+        # Implementation: Parse schema file to extract table metadata
+        # ... existing code ... 

@@ -11,6 +11,12 @@ class MetadataValidator:
     """Validates and completes metadata structures for database objects."""
     
     def __init__(self, db_connection: DatabaseInterface):
+        """Initialize the validator with a database connection.
+        
+        Args:
+            db_connection: Database interface for querying metadata
+        """
+        # Implementation: Store database connection for metadata retrieval
         self.db_connection = db_connection
     
     # Expected structure of TableMetadata with default values
@@ -35,6 +41,7 @@ class MetadataValidator:
         Returns:
             Dict[str, Any]: Complete and valid table metadata
         """
+        # Implementation: Validate and complete table metadata with appropriate defaults
         if not metadata:
             metadata = {}
         
@@ -56,19 +63,30 @@ class MetadataValidator:
         complete_metadata.update(metadata)
         
         # Ensure definition exists
+        # Implementation: If schema exists but definition doesn't, use schema as definition
         if not complete_metadata['definition'] and complete_metadata.get('schema'):
             complete_metadata['definition'] = complete_metadata['schema']
         
         # Enhance metadata with any missing but required elements
+        # Implementation: Query database to fill in missing metadata details
         self._enhance_table_metadata(complete_metadata)
         
         return complete_metadata
     
     def _enhance_table_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
-        """Ensure all required metadata fields are present and populated."""
+        """Ensure all required metadata fields are present and populated.
+        
+        Args:
+            metadata: Partially complete metadata dictionary
+            
+        Returns:
+            Enhanced metadata dictionary
+        """
+        # Implementation: Auto-discovery of missing metadata by querying database
         table_name = metadata['name']
         
         # Ensure definition exists
+        # Implementation: Retrieve CREATE TABLE statement from database if missing
         if not metadata['definition'] or not metadata['schema']:
             try:
                 create_statement = self.db_connection.execute_query(
@@ -84,6 +102,7 @@ class MetadataValidator:
                 logger.warning(f"Could not retrieve CREATE statement for {table_name}: {e}")
         
         # Ensure columns exist
+        # Implementation: Query column information if missing
         if not metadata['columns']:
             try:
                 columns = self.db_connection.get_column_metadata(table_name)
@@ -94,6 +113,7 @@ class MetadataValidator:
                 logger.warning(f"Could not retrieve columns for {table_name}: {e}")
         
         # Ensure primary key exists
+        # Implementation: Query primary key information if missing
         if not metadata['primary_key']:
             try:
                 result = self.db_connection.execute_query(
@@ -110,6 +130,7 @@ class MetadataValidator:
                 logger.warning(f"Could not retrieve primary key for {table_name}: {e}")
         
         # If we still have no definition but have columns, attempt to create a simple CREATE TABLE statement
+        # Implementation: Generate synthetic CREATE TABLE statement from column information
         if not metadata['definition'] and metadata['columns']:
             try:
                 column_info = self.db_connection.execute_query(
@@ -150,18 +171,19 @@ class MetadataValidator:
             metadata: Dictionary containing table metadata
             
         Returns:
-            TableMetadata: Object representation of the table metadata
+            TableMetadata object
         """
-        # Validate and complete metadata
-        complete_metadata = self.validate_table_metadata(metadata)
+        # Implementation: Convert dictionary representation to domain model object
+        validated_metadata = self.validate_table_metadata(metadata)
         
-        # Convert to TableMetadata object
+        # Construct TableMetadata object
         return TableMetadata(
-            name=complete_metadata['name'],
-            columns=complete_metadata['columns'],
-            primary_key=complete_metadata['primary_key'],
-            foreign_keys=complete_metadata['foreign_keys'],
-            indexes=complete_metadata['indexes'],
-            constraints=complete_metadata['constraints'],
-            schema=complete_metadata['schema'] or complete_metadata['definition']
+            name=validated_metadata['name'],
+            columns=validated_metadata['columns'],
+            primary_key=validated_metadata['primary_key'],
+            foreign_keys=validated_metadata['foreign_keys'],
+            indexes=validated_metadata['indexes'],
+            constraints=validated_metadata['constraints'],
+            schema=validated_metadata['schema'],
+            definition=validated_metadata['definition']
         ) 

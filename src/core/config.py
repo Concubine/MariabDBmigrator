@@ -12,41 +12,47 @@ from src.infrastructure.parallel import parse_worker_count
 @dataclass
 class DatabaseConfig:
     """Database connection configuration."""
-    host: str
-    port: int
-    user: str
-    password: str = ""
-    database: str = ""  # Optional with default empty string
-    use_pure: bool = True  # Add default value
-    auth_plugin: Optional[str] = None  # Already has default None
-    ssl: bool = False  # Add default value
-    ssl_ca: Optional[str] = None  # Already has default None
-    ssl_cert: Optional[str] = None  # Already has default None
-    ssl_key: Optional[str] = None  # Already has default None
-    ssl_verify_cert: bool = False  # Add default value
-    ssl_verify_identity: bool = False  # Add default value
+    # Required parameters
+    host: str          # Database server hostname or IP
+    port: int          # Database server port
+    user: str          # Database username
+    
+    # Optional parameters with defaults
+    password: str = ""  # Database password
+    database: str = ""  # Database name to connect to
+    use_pure: bool = True  # Use pure Python implementation vs C extension
+    auth_plugin: Optional[str] = None  # Authentication plugin name
+    
+    # SSL parameters
+    ssl: bool = False  # Enable SSL/TLS connection
+    ssl_ca: Optional[str] = None  # Path to CA certificate
+    ssl_cert: Optional[str] = None  # Path to client certificate
+    ssl_key: Optional[str] = None  # Path to client private key
+    ssl_verify_cert: bool = False  # Verify server certificate
+    ssl_verify_identity: bool = False  # Verify server identity
 
 @dataclass
 class ExportConfig:
     """Export operation configuration."""
-    output_dir: str
-    batch_size: int
-    compression: bool
-    parallel_workers: int
-    tables: list[str]
-    where: str
-    exclude_schema: bool
-    exclude_indexes: bool
-    exclude_constraints: bool
-    exclude_tables: list[str]
-    exclude_data: list[str]
-    include_information_schema: bool
+    output_dir: str        # Directory to store exported data
+    batch_size: int        # Number of rows to process at once
+    compression: bool      # Whether to compress output files
+    parallel_workers: int  # Number of parallel workers for export
+    tables: list[str]      # Tables to export (empty means all)
+    where: str             # WHERE clause for filtering exported data
+    exclude_schema: bool   # Skip exporting schema
+    exclude_indexes: bool  # Skip exporting indexes
+    exclude_constraints: bool  # Skip exporting constraints
+    exclude_tables: list[str]  # Tables to exclude from export
+    exclude_data: list[str]    # Tables to exclude data (schema only)
+    include_information_schema: bool  # Include information_schema tables
 
     def __init__(self, output_dir: str = 'exports', batch_size: int = 1000, compression: bool = False,
                  parallel_workers: int = 1, tables: list[str] = None, where: str = '',
                  exclude_schema: bool = False, exclude_indexes: bool = False,
                  exclude_constraints: bool = False, exclude_tables: list[str] = None,
                  exclude_data: list[str] = None, include_information_schema: bool = False):
+        # Initialize with defaults and normalize empty lists
         self.output_dir = output_dir
         self.batch_size = batch_size
         self.compression = compression
@@ -63,19 +69,19 @@ class ExportConfig:
 @dataclass
 class ImportConfig:
     """Import operation configuration."""
-    input_dir: str
-    batch_size: int
-    compression: bool
-    parallel_workers: int
-    mode: str
-    exclude_schema: bool
-    exclude_indexes: bool
-    exclude_constraints: bool
-    disable_foreign_keys: bool
-    continue_on_error: bool
-    import_schema: bool
-    import_data: bool
-    database: str = ""  # Target database for import
+    input_dir: str         # Directory containing files to import
+    batch_size: int        # Number of rows to process at once
+    compression: bool      # Whether input files are compressed
+    parallel_workers: int  # Number of parallel workers for import
+    mode: str              # Import mode (skip, replace, cancel)
+    exclude_schema: bool   # Skip importing schema
+    exclude_indexes: bool  # Skip importing indexes
+    exclude_constraints: bool  # Skip importing constraints
+    disable_foreign_keys: bool  # Disable foreign key checks during import
+    continue_on_error: bool     # Continue import after errors
+    import_schema: bool         # Import table schemas
+    import_data: bool           # Import table data
+    database: str = ""          # Target database for import
 
     def __init__(self, input_dir: str = 'exports', batch_size: int = 1000, compression: bool = False,
                  parallel_workers: int = 1, mode: str = 'cancel',
@@ -83,6 +89,7 @@ class ImportConfig:
                  exclude_constraints: bool = False, disable_foreign_keys: bool = True,
                  continue_on_error: bool = False, import_schema: bool = True,
                  import_data: bool = True, database: str = ""):
+        # Initialize with defaults
         self.input_dir = input_dir
         self.batch_size = batch_size
         self.compression = compression
@@ -100,17 +107,19 @@ class ImportConfig:
 @dataclass
 class LoggingConfig:
     """Logging configuration."""
-    level: str
-    file: str
-    format: str
+    level: str   # Logging level (INFO, DEBUG, etc.)
+    file: str    # Path to log file (empty means log to console only)
+    format: str  # Log message format string
+    data_diff_tracking: bool = False  # Enable tracking data differences between export/import
+    data_diff_file: str = ""          # File to store data difference reports
 
 @dataclass
 class Config:
     """Main configuration class."""
-    database: DatabaseConfig
-    export: ExportConfig
-    import_: ImportConfig
-    logging: LoggingConfig
+    database: DatabaseConfig  # Database connection settings
+    export: ExportConfig      # Export operation settings
+    import_: ImportConfig     # Import operation settings
+    logging: LoggingConfig    # Logging settings
 
 def get_default_config_path() -> Path:
     """Get the default configuration file path.
@@ -118,7 +127,7 @@ def get_default_config_path() -> Path:
     First checks for a config file in the same directory as the executable,
     then falls back to the bundled config file.
     """
-    # Get the directory containing the executable
+    # Determine base directory based on execution context
     if getattr(sys, 'frozen', False):
         # Running as compiled executable
         exe_dir = Path(sys.executable).parent
@@ -147,16 +156,19 @@ def load_config(config_path: Optional[Path] = None) -> Config:
     Raises:
         ConfigError: If configuration is invalid or missing required fields
     """
+    # Use default path if none provided
     if config_path is None:
         config_path = get_default_config_path()
         
+    # Verify config file exists
     if not config_path.exists():
         raise ConfigError(f"Configuration file not found: {config_path}")
         
+    # Load and parse YAML
     with open(config_path, 'r') as f:
         config_dict = yaml.safe_load(f)
     
-    # Load database config
+    # Load database config with defaults
     db_config = config_dict.get('database', {})
     database = DatabaseConfig(
         host=db_config.get('host', 'localhost'),
@@ -174,7 +186,7 @@ def load_config(config_path: Optional[Path] = None) -> Config:
         ssl_verify_identity=db_config.get('ssl_verify_identity', False)
     )
     
-    # Load export config
+    # Load export config with defaults
     export_config = config_dict.get('export', {})
     export = ExportConfig(
         output_dir=export_config.get('output_dir', 'exports'),
@@ -191,7 +203,7 @@ def load_config(config_path: Optional[Path] = None) -> Config:
         include_information_schema=export_config.get('include_information_schema', False)
     )
     
-    # Load import config
+    # Load import config with defaults
     import_config = config_dict.get('import', {})
     import_ = ImportConfig(
         input_dir=import_config.get('input_dir', export.output_dir),
@@ -209,14 +221,17 @@ def load_config(config_path: Optional[Path] = None) -> Config:
         database=import_config.get('database', '')
     )
     
-    # Load logging config
+    # Load logging config with defaults
     logging_config = config_dict.get('logging', {})
     logging = LoggingConfig(
         level=logging_config.get('level', 'INFO'),
         file=logging_config.get('file', ''),
-        format=logging_config.get('format', '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        format=logging_config.get('format', '%(asctime)s - %(name)s - %(levelname)s - %(message)s'),
+        data_diff_tracking=logging_config.get('data_diff_tracking', False),
+        data_diff_file=logging_config.get('data_diff_file', '')
     )
     
+    # Construct complete config object
     return Config(
         database=database,
         export=export,

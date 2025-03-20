@@ -1,16 +1,112 @@
 """ASCII interface implementation."""
 import sys
 import time
-from typing import Optional, List
+import os
+import shutil
+from typing import Optional, List, Tuple
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
 
-from ..domain.models import ExportResult, ExportFormat
+# Fix import error: Remove ExportFormat and use proper import path
+try:
+    from ..domain.models import ExportResult
+except ImportError:
+    # Define a fallback for compiled version
+    @dataclass
+    class ExportResult:
+        """Result of an export operation."""
+        table_name: str
+        success: bool
+        rows_exported: int = 0
+        file_path: str = ""
+        file_size: int = 0
+        duration: float = 0.0
+        error_message: str = ""
+
 from ..ui.progress import ProgressStats
 from ..core.logging import get_logger
 
 logger = get_logger(__name__)
+
+class Box:
+    """ASCII box drawing characters."""
+    # Basic characters
+    horizontal = "─"
+    vertical = "│"
+    corner_top_left = "┌"
+    corner_top_right = "┐"
+    corner_bottom_left = "└"
+    corner_bottom_right = "┘"
+    T_right = "├"
+    T_left = "┤"
+    T_down = "┬"
+    T_up = "┴"
+    cross = "┼"
+    
+    # Double line characters
+    double_horizontal = "═"
+    double_vertical = "║"
+    double_corner_top_left = "╔"
+    double_corner_top_right = "╗"
+    double_corner_bottom_left = "╚"
+    double_corner_bottom_right = "╝"
+    double_T_right = "╠"
+    double_T_left = "╣"
+    double_T_down = "╦"
+    double_T_up = "╩"
+    double_cross = "╬"
+    
+    # Block characters
+    block_full = "█"
+    block_light = "░"
+    block_medium = "▒"
+    block_dark = "▓"
+
+def get_term_size() -> Tuple[int, int]:
+    """Get terminal size.
+    
+    Returns:
+        Tuple of (width, height)
+    """
+    try:
+        columns, lines = shutil.get_terminal_size()
+        return columns, lines
+    except (AttributeError, OSError):
+        # Fallback to environment variables or default
+        return (
+            int(os.environ.get("COLUMNS", 80)),
+            int(os.environ.get("LINES", 24))
+        )
+
+class ProgressBar:
+    """ASCII progress bar."""
+    
+    def __init__(self, width: int = 50, fill_char: str = "█", empty_char: str = "░"):
+        """Initialize progress bar.
+        
+        Args:
+            width: Width of the progress bar
+            fill_char: Character used for filled portion
+            empty_char: Character used for empty portion
+        """
+        self.width = width
+        self.fill_char = fill_char
+        self.empty_char = empty_char
+    
+    def update(self, progress: float) -> str:
+        """Update progress bar.
+        
+        Args:
+            progress: Progress value between 0.0 and 1.0
+            
+        Returns:
+            Formatted progress bar
+        """
+        filled_width = min(int(self.width * progress), self.width)
+        empty_width = self.width - filled_width
+        
+        return self.fill_char * filled_width + self.empty_char * empty_width
 
 class ASCIIInterface:
     """ASCII-based command line interface."""
