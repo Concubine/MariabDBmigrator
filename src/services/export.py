@@ -3,6 +3,7 @@ import os
 import logging
 import time
 import sys
+import json
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -223,6 +224,9 @@ class ExportService:
         output_dir = Path(self.config.output_dir) / database_name
         os.makedirs(output_dir, exist_ok=True)
         
+        # First, create the metadata file for this database to assist with imports
+        self._export_metadata(database_name, output_dir)
+        
         logger.info(f"Exporting additional database objects for {database_name}")
         print(f"Exporting additional database objects for {database_name}")
         
@@ -236,28 +240,52 @@ class ExportService:
         
         # Export triggers
         if not self.config.exclude_triggers:
-            trigger_count = self._export_triggers(database_name, output_dir)
+            try:
+                trigger_count = self._export_triggers(database_name, output_dir)
+            except Exception as e:
+                logger.error(f"Failed to export triggers: {str(e)}")
+                print(f"[ERROR] Failed to export triggers: {str(e)}")
             
         # Export stored procedures
         if not self.config.exclude_procedures:
-            procedure_count = self._export_stored_procedures(database_name, output_dir)
+            try:
+                procedure_count = self._export_stored_procedures(database_name, output_dir)
+            except Exception as e:
+                logger.error(f"Failed to export stored procedures: {str(e)}")
+                print(f"[ERROR] Failed to export stored procedures: {str(e)}")
             
         # Export views
         if not self.config.exclude_views:
-            view_count = self._export_views(database_name, output_dir)
+            try:
+                view_count = self._export_views(database_name, output_dir)
+            except Exception as e:
+                logger.error(f"Failed to export views: {str(e)}")
+                print(f"[ERROR] Failed to export views: {str(e)}")
             
         # Export events
         if not self.config.exclude_events:
-            event_count = self._export_events(database_name, output_dir)
-            
+            try:
+                event_count = self._export_events(database_name, output_dir)
+            except Exception as e:
+                logger.error(f"Failed to export events: {str(e)}")
+                print(f"[ERROR] Failed to export events: {str(e)}")
+                
         # Export functions
         if not self.config.exclude_functions:
-            function_count = self._export_functions(database_name, output_dir)
-            
+            try:
+                function_count = self._export_functions(database_name, output_dir)
+            except Exception as e:
+                logger.error(f"Failed to export functions: {str(e)}")
+                print(f"[ERROR] Failed to export functions: {str(e)}")
+                
         # Export user-defined types
         if not self.config.exclude_user_types:
-            user_type_count = self._export_user_types(database_name, output_dir)
-            
+            try:
+                user_type_count = self._export_user_types(database_name, output_dir)
+            except Exception as e:
+                logger.error(f"Failed to export user-defined types: {str(e)}")
+                print(f"[ERROR] Failed to export user-defined types: {str(e)}")
+        
         return (trigger_count, procedure_count, view_count, event_count, function_count, user_type_count)
 
     def _export_triggers(self, database_name: str, output_dir: Path) -> int:
@@ -302,13 +330,13 @@ class ExportService:
                 f.write("DELIMITER ;\n")
                 
             logger.info(f"Triggers exported to {file_path}")
-            print(f"✓ Triggers exported to {file_path}")
+            print(f"[OK] Triggers exported to {file_path}")
             
             return len(triggers)
                 
         except Exception as e:
             logger.error(f"Error exporting triggers: {str(e)}")
-            print(f"✗ Error exporting triggers: {str(e)}")
+            print(f"[ERROR] Error exporting triggers: {str(e)}")
             return 0
 
     def _export_stored_procedures(self, database_name: str, output_dir: Path) -> int:
@@ -353,13 +381,13 @@ class ExportService:
                 f.write("DELIMITER ;\n")
                 
             logger.info(f"Stored procedures exported to {file_path}")
-            print(f"✓ Stored procedures exported to {file_path}")
+            print(f"[OK] Stored procedures exported to {file_path}")
             
             return len(procedures)
                 
         except Exception as e:
             logger.error(f"Error exporting stored procedures: {str(e)}")
-            print(f"✗ Error exporting stored procedures: {str(e)}")
+            print(f"[ERROR] Error exporting stored procedures: {str(e)}")
             return 0
 
     def _export_views(self, database_name: str, output_dir: Path) -> int:
@@ -397,13 +425,13 @@ class ExportService:
                     f.write(f"CREATE VIEW `{view['name']}` AS {view['definition']};\n\n")
                     
             logger.info(f"Views exported to {file_path}")
-            print(f"✓ Views exported to {file_path}")
+            print(f"[OK] Views exported to {file_path}")
             
             return len(views)
                 
         except Exception as e:
             logger.error(f"Error exporting views: {str(e)}")
-            print(f"✗ Error exporting views: {str(e)}")
+            print(f"[ERROR] Error exporting views: {str(e)}")
             return 0
 
     def _export_events(self, database_name: str, output_dir: Path) -> int:
@@ -460,13 +488,13 @@ class ExportService:
                 f.write("DELIMITER ;\n")
                 
             logger.info(f"Events exported to {file_path}")
-            print(f"✓ Events exported to {file_path}")
+            print(f"[OK] Events exported to {file_path}")
             
             return len(events)
                 
         except Exception as e:
             logger.error(f"Error exporting events: {str(e)}")
-            print(f"✗ Error exporting events: {str(e)}")
+            print(f"[ERROR] Error exporting events: {str(e)}")
             return 0
 
     def _export_functions(self, database_name: str, output_dir: Path) -> int:
@@ -520,13 +548,13 @@ class ExportService:
                 f.write("DELIMITER ;\n")
                 
             logger.info(f"Functions exported to {file_path}")
-            print(f"✓ Functions exported to {file_path}")
+            print(f"[OK] Functions exported to {file_path}")
             
             return len(functions)
                 
         except Exception as e:
             logger.error(f"Error exporting functions: {str(e)}")
-            print(f"✗ Error exporting functions: {str(e)}")
+            print(f"[ERROR] Error exporting functions: {str(e)}")
             return 0
 
     def _export_user_types(self, database_name: str, output_dir: Path) -> int:
@@ -564,13 +592,13 @@ class ExportService:
                     f.write(f"CREATE TYPE `{user_type['name']}` AS {user_type['definition']};\n\n")
                     
             logger.info(f"User-defined types exported to {file_path}")
-            print(f"✓ User-defined types exported to {file_path}")
+            print(f"[OK] User-defined types exported to {file_path}")
             
             return len(user_types)
                 
         except Exception as e:
             logger.error(f"Error exporting user-defined types: {str(e)}")
-            print(f"✗ Error exporting user-defined types: {str(e)}")
+            print(f"[ERROR] Error exporting user-defined types: {str(e)}")
             return 0
 
     def _format_time(self, seconds: float) -> str:
@@ -675,7 +703,7 @@ class ExportService:
             )
             
             # Print to console too
-            print(f"✓ {table_name}: {rows_exported} rows, {self._format_size(file_size)}, {self._format_time(elapsed_time)}")
+            print(f"[OK] {table_name}: {rows_exported} rows, {self._format_size(file_size)}, {self._format_time(elapsed_time)}")
             
             # Update UI if available
             if self.ui and hasattr(self.ui, 'display_export_result'):
@@ -685,7 +713,7 @@ class ExportService:
             
         except Exception as e:
             logger.error(f"Error exporting table {table_name}: {str(e)}")
-            print(f"✗ Error exporting {table_name}: {str(e)}")
+            print(f"[ERROR] Error exporting {table_name}: {str(e)}")
             
             # Create failure result
             result = ExportResult(
@@ -892,6 +920,38 @@ class ExportService:
         except Exception as e:
             raise ExportError(f"Failed to export schema for table {table_name}: {str(e)}")
             
+    def _export_metadata(self, database_name: str, output_dir: Path) -> Path:
+        """Export metadata about the export operation.
+        
+        Args:
+            database_name: Database name
+            output_dir: Output directory
+            
+        Returns:
+            Path to the metadata file
+        """
+        logger.info(f"Exporting metadata for database: {database_name}")
+        
+        metadata = {
+            'database': database_name,
+            'timestamp': time.time(),
+            'date': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'exported_by': 'MariaDB Export Tool',
+            'version': '1.0.0',  # Tool version
+        }
+        
+        file_path = output_dir / "metadata.json"
+        
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump(metadata, f, indent=2)
+            
+            logger.info(f"Metadata exported to {file_path}")
+            return file_path
+        except Exception as e:
+            logger.error(f"Error exporting metadata: {str(e)}")
+            return None
+
     def _export_database_tables(self) -> List[ExportResult]:
         """Export tables from the current database.
         
@@ -901,6 +961,13 @@ class ExportService:
         # Get the current database name
         database = self.db.config.get('database', '')
         logger.info(f"Exporting from database: {database}")
+        
+        # Ensure output directory exists
+        output_dir = Path(self.config.output_dir) / database
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Export metadata first
+        self._export_metadata(database, output_dir)
         
         # Get list of tables
         tables = self.db.get_table_names()

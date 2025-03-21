@@ -288,14 +288,14 @@ def main() -> int:
                     logging.info(f"Scanning input directory: {input_dir}")
                     
                     if os.path.exists(input_dir) and os.path.isdir(input_dir):
-                        # Recursively scan for SQL files
+                        # Recursively scan for SQL files and metadata.json files
                         for root, _, files in os.walk(input_dir):
                             for file in files:
-                                if file.endswith('.sql'):
+                                if file.endswith('.sql') or file == 'metadata.json':
                                     file_path = os.path.join(root, file)
                                     import_files.append(file_path)
                         
-                        logging.info(f"Found {len(import_files)} SQL files in {input_dir} and its subdirectories")
+                        logging.info(f"Found {len(import_files)} files in {input_dir} and its subdirectories")
                     else:
                         logging.warning(f"Input directory {input_dir} does not exist or is not a directory")
                 

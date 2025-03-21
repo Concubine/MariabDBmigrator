@@ -3,6 +3,7 @@ import logging
 import time
 import os
 import hashlib
+import json
 from pathlib import Path
 from typing import List, Optional, Any, Dict, Tuple
 import re
@@ -108,8 +109,53 @@ class ImportService:
         self.db = mariadb
         self.storage = storage_service
         
+        # Metadata files are processed separately
+        self.metadata_files = [f for f in self.files if os.path.basename(f) == 'metadata.json']
+        # Other files are used for actual import
+        self.import_files = [f for f in self.files if os.path.basename(f) != 'metadata.json']
+        
+        # Log metadata files found
+        if self.metadata_files:
+            logger.info(f"Found {len(self.metadata_files)} metadata files: {', '.join(self.metadata_files)}")
+        else:
+            logger.warning("No metadata.json files found in the import list")
+            # Try to find metadata.json in subdirectories
+            for file_path in self.files:
+                # Get the containing directory
+                dir_path = os.path.dirname(file_path)
+                potential_metadata_path = os.path.join(dir_path, 'metadata.json')
+                if os.path.exists(potential_metadata_path) and os.path.isfile(potential_metadata_path):
+                    logger.info(f"Found metadata file in import directory: {potential_metadata_path}")
+                    self.metadata_files.append(potential_metadata_path)
+                    break
+        
         # Fix: Get database from config instead of directly accessing the attribute
         self.database = mariadb.config.get('database', '')
+        logger.info(f"Database from config: '{self.database}'")
+        
+        # If database is not specified in config, try to get it from metadata
+        if not self.database and self.metadata_files:
+            try:
+                metadata_file = self.metadata_files[0]
+                logger.info(f"Trying to read database from metadata file: {metadata_file}")
+                with open(metadata_file, 'r', encoding='utf-8') as f:
+                    metadata = json.load(f)
+                    if 'database' in metadata:
+                        self.database = metadata['database']
+                        logger.info(f"Using database from metadata: {self.database}")
+                    else:
+                        logger.warning(f"Metadata file does not contain 'database' field: {metadata}")
+            except Exception as e:
+                logger.warning(f"Could not read metadata file: {str(e)}")
+                # Try to check if file exists
+                if not os.path.exists(metadata_file):
+                    logger.error(f"Metadata file not found: {metadata_file}")
+                elif not os.path.isfile(metadata_file):
+                    logger.error(f"Metadata file is not a file: {metadata_file}")
+                elif os.path.getsize(metadata_file) == 0:
+                    logger.error(f"Metadata file is empty: {metadata_file}")
+        elif not self.database:
+            logger.warning("No database specified in config and no metadata files found")
         
         self.logger = logging.getLogger('import')
         
@@ -131,17 +177,25 @@ class ImportService:
             self.table_mapping = self.config.table_mapping
             logger.info(f"Using table name mapping for {len(self.table_mapping)} tables")
         
-    def import_data(self) -> dict:
+    def import_data(self) -> List[ImportResult]:
         """Import data from the specified files."""
-        self.logger.info(f"Importing {len(self.files)} files")
+        self.logger.info(f"Importing {len(self.import_files)} files")
         
         # Ensure database is selected
         if not self.database:
             self.logger.error("No database specified for import")
             raise ValueError("No database specified for import. Please specify a database in the configuration.")
             
-        # Ensure database exists and is selected
+        # Check if database exists and create it if needed
         try:
+            # First check if database exists
+            existing_databases = self.db.get_available_databases()
+            if self.database not in existing_databases:
+                self.logger.info(f"Database '{self.database}' does not exist, creating it")
+                self.db.execute(f"CREATE DATABASE `{self.database}`")
+                self.logger.info(f"Created database: {self.database}")
+            
+            # Then select the database
             self.db.execute(f"USE `{self.database}`")
             self.logger.info(f"Selected database: {self.database}")
         except Exception as e:
@@ -159,7 +213,7 @@ class ImportService:
         user_types_files = []
         
         # Sort files into their respective categories
-        for file in self.files:
+        for file in self.import_files:
             filename = os.path.basename(file).lower()
             if filename.endswith('_schema.sql'):
                 table_schema_files.append(file)
@@ -194,8 +248,7 @@ class ImportService:
             self.logger.info("Import mode: MERGE - Merging with existing objects")
         elif self.config.mode == ImportMode.OVERWRITE:
             self.logger.info("Import mode: OVERWRITE - Overwriting existing objects")
-            if not self.config.force_drop:
-                self._handle_overwrite_mode(table_schema_files)
+            self._handle_overwrite_mode(table_schema_files)
         elif self.config.mode == ImportMode.CANCEL:
             self.logger.info("Import mode: CANCEL - Will cancel on collision")
             
@@ -392,10 +445,21 @@ class ImportService:
         print("\n".join(objects_imported))
         
         # Return results
-        return {
-            'success': stats['errors'] == 0,
-            'stats': stats
-        }
+        results = []
+        for file_path in self.import_files:
+            # Create an ImportResult object for each file
+            file_name = os.path.basename(file_path)
+            table_name = file_name.replace('_schema.sql', '').replace('_data.sql', '')
+            
+            # Use local ImportResult class rather than the imported one
+            result = ImportResult(
+                file_name=file_name,
+                file_path=file_path,
+                status="success" if stats['errors'] == 0 else "error" if not self.config.continue_on_error else "warning"
+            )
+            results.append(result)
+            
+        return results
 
     def _calculate_file_checksum(self, file_path: str) -> Optional[str]:
         """Calculate MD5 checksum for a file.
@@ -759,93 +823,199 @@ class ImportService:
             self.db.execute(f"TRUNCATE TABLE `{table_name}`")
         # MERGE mode doesn't need any special handling - it will just add data
 
-    def _import_file(self, file_path: str) -> dict:
-        """Import a file containing SQL statements.
+    def _import_direct_execute(self, file_content, file_path):
+        """Directly execute a SQL file with special objects using the raw cursor
+        
+        This method bypasses normal statement splitting for special object files
+        like stored procedures, functions, triggers, and views
         
         Args:
-            file_path: Path to the file to import
+            file_content: Content of the SQL file
+            file_path: Path to the file being imported
             
         Returns:
-            Dictionary with import result information
+            Dictionary with import results
         """
         result = {
-            'success': False,
-            'warning': False,
-            'error': None,
-            'file': os.path.basename(file_path),
-            'rows_affected': 0
+            'success': True,
+            'statements_total': 1,
+            'statements_executed': 0,
+            'errors': [],
+            'warnings': []
         }
         
-        file_content = self._read_file_with_multiple_encodings(file_path)
-        if not file_content:
-            self.logger.error(f"Could not read file {file_path}")
-            result['error'] = f"Could not read file {file_path}"
-            return result
-        
-        # If this is a schema file, extract table name
-        filename = os.path.basename(file_path)
-        if filename.endswith('_schema.sql'):
-            table_name = filename.replace('_schema.sql', '')
-            self.logger.info(f"Importing schema for table {table_name}")
-        
-        # Check if the file is valid SQL
-        if not file_content.strip():
-            self.logger.warning(f"File {file_path} is empty or contains only whitespace")
-            result['warning'] = True
-            result['success'] = True
-            return result
-        
-        # Process SQL statements from the file
         try:
-            # Apply delimiter handling logic
-            sql_statements = self._split_sql_statements(file_content)
-            if not sql_statements:
-                self.logger.warning(f"No SQL statements found in file {file_path}")
-                result['warning'] = True
-                result['success'] = True
-                return result
-            
-            total_affected = 0
-            for sql in sql_statements:
-                if not sql.strip():
-                    continue
+            # First, extract and execute DROP statements separately
+            drop_pattern = r"DROP\s+(PROCEDURE|FUNCTION|TRIGGER|EVENT|VIEW)\s+IF\s+EXISTS\s+`?(\w+)`?[;\s]*"
+            for match in re.finditer(drop_pattern, file_content, re.IGNORECASE):
+                object_type = match.group(1)
+                object_name = match.group(2)
                 
+                drop_stmt = f"DROP {object_type} IF EXISTS `{object_name}`"
                 try:
-                    # Execute the SQL statement
-                    affected = self.db.execute(sql)
-                    total_affected += affected if affected is not None else 0
-                    
+                    self.db.execute(drop_stmt)
+                    self.logger.debug(f"Dropped existing {object_type.lower()}: {object_name}")
                 except Exception as e:
-                    error_message = str(e)
-                    
-                    # Check if it's a duplicate object error and mode is SKIP
-                    if self.config.mode == ImportMode.SKIP and (
-                        "already exists" in error_message or 
-                        "Duplicate" in error_message
-                    ):
-                        self.logger.info(f"Skipping existing object: {error_message}")
-                        result['warning'] = True
-                        continue
-                    
-                    # If in CONTINUE_ON_ERROR mode, log the error but don't stop
-                    if self.config.continue_on_error:
-                        self.logger.warning(f"Error executing statement: {error_message}")
-                        result['warning'] = True
-                        continue
-                    
-                    # Otherwise, fail the import
-                    self.logger.error(f"Error executing statement: {error_message}")
-                    result['error'] = f"Failed to execute SQL: {error_message}"
-                    return result
+                    error_msg = str(e)
+                    self.logger.warning(f"Error dropping {object_type.lower()} {object_name}: {error_msg}")
+                    result['warnings'].append(f"Error dropping {object_type}: {error_msg}")
             
-            # Success!
-            result['success'] = True
-            result['rows_affected'] = total_affected
+            # Extract CREATE statements from file
+            # Remove comments and empty lines to make parsing easier
+            content_lines = []
+            for line in file_content.splitlines():
+                if line.strip() and not line.strip().startswith('--'):
+                    content_lines.append(line)
+            
+            # Rejoin without comment lines
+            processed_content = '\n'.join(content_lines)
+            
+            # Now extract CREATE statements using regex pattern matching
+            create_patterns = {
+                'PROCEDURE': r'CREATE\s+(?:DEFINER\s*=\s*[^\s]+\s+)?PROCEDURE\s+`?([^`\s(]+)`?(?:\s*\([^)]*\))?\s*(?:COMMENT\s+\'[^\']*\')?\s*(?:LANGUAGE\s+SQL\s+|READS\s+SQL\s+DATA\s+|MODIFIES\s+SQL\s+DATA\s+|CONTAINS\s+SQL\s+|NOT\s+DETERMINISTIC\s+|DETERMINISTIC\s+)*(?:BEGIN|RETURN|CALL|SET|IF|WHILE|LOOP|SELECT|DECLARE|INSERT|UPDATE|DELETE).*?END',
+                'FUNCTION': r'CREATE\s+(?:DEFINER\s*=\s*[^\s]+\s+)?FUNCTION\s+`?([^`\s(]+)`?(?:\s*\([^)]*\))?\s*RETURNS\s+(?:.*?)(?:BEGIN|RETURN|CALL|SET|IF|WHILE|LOOP|DECLARE).*?END',
+                'TRIGGER': r'CREATE\s+(?:DEFINER\s*=\s*[^\s]+\s+)?TRIGGER\s+`?([^`\s]+)`?[^;]*?(?:BEGIN|FOR EACH ROW).*?END',
+                'EVENT': r'CREATE\s+(?:DEFINER\s*=\s*[^\s]+\s+)?EVENT\s+`?([^`\s]+)`?[^;]*?(?:BEGIN|DO|CALL).*?END',
+                'VIEW': r'CREATE\s+(?:OR\s+REPLACE\s+)?(?:DEFINER\s*=\s*[^\s]+\s+)?(?:SQL\s+SECURITY\s+[^\s]+\s+)?VIEW\s+`?([^`\s]+)`?[^;]*;'
+            }
+            
+            filename = os.path.basename(file_path).lower()
+            object_type = None
+            
+            if 'procedures.sql' in filename:
+                object_type = 'PROCEDURE'
+            elif 'functions.sql' in filename:
+                object_type = 'FUNCTION'
+            elif 'triggers.sql' in filename:
+                object_type = 'TRIGGER'
+            elif 'events.sql' in filename:
+                object_type = 'EVENT'
+            elif 'views.sql' in filename:
+                object_type = 'VIEW'
+            
+            if object_type:
+                # Use the dedicated procedure executor for better handling
+                if object_type == 'PROCEDURE':
+                    return self._execute_create_procedure(file_content, result)
+                
+                pattern = create_patterns[object_type]
+                
+                # Try to find all matching objects
+                for match in re.finditer(pattern, processed_content, re.IGNORECASE | re.DOTALL):
+                    object_name = match.group(1)
+                    self.logger.info(f"Creating {object_type.lower()}: {object_name}")
+                    
+                    # Extract the full SQL statement
+                    full_stmt = match.group(0)
+                    
+                    # Clean up the statement
+                    full_stmt = full_stmt.strip()
+                    if not full_stmt.endswith(';'):
+                        full_stmt += ';'
+                    
+                    self.logger.debug(f"Full statement to execute:\n{full_stmt}")
+                    
+                    try:
+                        # Use a raw cursor for direct execution
+                        with self.db.connection.cursor() as cursor:
+                            self.logger.debug("About to execute procedure statement")
+                            # Try to extract the procedure name from the query if it's not already known
+                            if not object_name:
+                                name_match = re.search(r'CREATE\s+(?:DEFINER\s*=\s*[^\s]+\s+)?(?:PROCEDURE|FUNCTION|TRIGGER|EVENT|VIEW)\s+`?([^`\s(]+)', full_stmt, re.IGNORECASE)
+                                if name_match:
+                                    object_name = name_match.group(1)
+                                else:
+                                    object_name = "unknown"
+                            cursor.execute(full_stmt)
+                            self.logger.debug("Procedure statement executed successfully")
+                        
+                        self.logger.info(f"Successfully created {object_type.lower()} {object_name}")
+                        result['statements_executed'] += 1
+                    except Exception as e:
+                        error_msg = str(e)
+                        self.logger.error(f"Error creating {object_type.lower()} {object_name}: {error_msg}")
+                        
+                        # Check if this is an undeclared variable error, which is common in procedures
+                        if "undeclared variable" in error_msg.lower():
+                            try:
+                                # Try to extract the variable name
+                                var_match = re.search(r"Undeclared variable: (\w+)", error_msg, re.IGNORECASE)
+                                if var_match:
+                                    var_name = var_match.group(1)
+                                    self.logger.info(f"Attempting to fix undeclared variable: {var_name}")
+                                    
+                                    # Add a DECLARE statement for this variable after BEGIN
+                                    modified_stmt = re.sub(
+                                        r'(BEGIN\s+)',
+                                        f'\\1DECLARE {var_name} INT DEFAULT 0;\n',
+                                        full_stmt,
+                                        flags=re.IGNORECASE
+                                    )
+                                    
+                                    self.logger.debug(f"Retrying with modified statement adding variable declaration")
+                                    with self.db.connection.cursor() as cursor:
+                                        cursor.execute(modified_stmt)
+                                    
+                                    self.logger.info(f"Successfully created {object_type.lower()} {object_name} after fixing variable")
+                                    result['statements_executed'] += 1
+                                    continue
+                            except Exception as var_e:
+                                self.logger.error(f"Failed to fix undeclared variable: {str(var_e)}")
+                        
+                        # If it's a multi-statement procedure, try a different approach with DELIMITER
+                        if "You have an error in your SQL syntax" in error_msg or "unexpected end of statement" in error_msg.lower():
+                            try:
+                                self.logger.info(f"Attempting to execute with DELIMITER syntax")
+                                with self.db.connection.cursor() as cursor:
+                                    # Set delimiter
+                                    cursor.execute("DELIMITER //")
+                                    
+                                    # Add END delimiter if missing
+                                    if not re.search(r'END\s*;?\s*$', full_stmt, re.IGNORECASE):
+                                        full_stmt = full_stmt.rstrip(';') + "\nEND //"
+                                    else:
+                                        full_stmt = full_stmt.rstrip(';') + " //"
+                                    
+                                    # Execute with delimiter
+                                    cursor.execute(full_stmt)
+                                    
+                                    # Reset delimiter
+                                    cursor.execute("DELIMITER ;")
+                                
+                                self.logger.info(f"Successfully created {object_type.lower()} {object_name} using DELIMITER syntax")
+                                result['statements_executed'] += 1
+                                continue
+                            except Exception as delim_e:
+                                self.logger.error(f"Failed DELIMITER approach: {str(delim_e)}")
+                        
+                        # If all else fails, record the error
+                        result['errors'].append(f"Error creating {object_type} {object_name}: {error_msg}")
+                
+                if result['statements_executed'] == 0:
+                    self.logger.warning(f"No {object_type.lower()}s were created from file {os.path.basename(file_path)}")
+                    result['warnings'].append(f"No {object_type.lower()}s were created")
+            else:
+                self.logger.warning(f"File type not recognized for special object handling: {os.path.basename(file_path)}")
+                result['warnings'].append("File type not recognized for special object handling")
+            
+            # Set success flag based on errors and executed statements
+            if result['errors']:
+                # If there are errors but we still created some objects
+                if result['statements_executed'] > 0 and self.config.continue_on_error:
+                    result['success'] = True
+                    # Convert errors to warnings instead since we want to continue
+                    result['warnings'].extend(result['errors'])
+                    result['errors'] = []
+                else:
+                    result['success'] = False
+            
             return result
             
         except Exception as e:
-            self.logger.error(f"Error processing file {file_path}: {str(e)}")
-            result['error'] = f"Error processing file: {str(e)}"
+            self.logger.error(f"Error in direct execute: {str(e)}")
+            self.logger.error(f"Error importing file {file_path}: {str(e)}")
+            result['success'] = False
+            result['errors'].append(f"Error importing file: {str(e)}")
             return result
 
     def _process_delimiter_sql_file(self, file_path: str) -> tuple:
@@ -932,56 +1102,505 @@ class ImportService:
             self.logger.error(error_msg)
             return statements_count, executed_count, [error_msg]
 
-    def _import_table(self, table: str) -> None:
-        """Import a single table."""
+    def _import_file(self, file_path: str) -> dict:
+        """Import a file containing SQL statements.
+        
+        Args:
+            file_path: Path to the file to import
+            
+        Returns:
+            Dictionary with import result information
+        """
+        start_time = time.time()
+        result = {
+            'success': False,
+            'warning': False,
+            'error': None,
+            'file': os.path.basename(file_path),
+            'rows_affected': 0
+        }
+        
+        file_content = self._read_file_with_multiple_encodings(file_path)
+        if not file_content:
+            self.logger.error(f"Could not read file {file_path}")
+            result['error'] = f"Could not read file {file_path}"
+            return result
+        
+        # Get file info
+        filename = os.path.basename(file_path).lower()
+        
+        # Special handling for stored procedures, functions, triggers, and events
+        special_files = ['procedures.sql', 'functions.sql', 'triggers.sql', 'events.sql', 'views.sql']
+        if filename in special_files:
+            self.logger.info(f"Using direct execution for special file: {filename}")
+            
+            # Try direct execution first
+            direct_result = self._import_direct_execute(file_content, file_path)
+            
+            if direct_result['success']:
+                result['success'] = True
+                execution_time = time.time() - start_time
+                result['execution_time'] = execution_time
+                self.logger.info(f"Successfully imported {filename} using direct execution in {execution_time:.2f}s")
+                return result
+            else:
+                self.logger.warning(f"Direct execution failed for {filename}, falling back to regular import")
+                # Fall through to regular import method
+        
+        # For regular files (not special objects), use the standard processing
+        if not file_content.strip():
+            self.logger.warning(f"File {file_path} is empty or contains only whitespace")
+            result['warning'] = True
+            result['success'] = True
+            return result
+            
+        # Process SQL statements from the file
         try:
-            logger.info(f"Importing table: {table}")
-            
-            # Apply table mapping if exists
-            mapped_table_name = self._get_mapped_table_name(table)
-            if mapped_table_name != table:
-                logger.info(f"Mapping table {table} to {mapped_table_name}")
-                table = mapped_table_name
-            
-            # Extract CREATE TABLE statement from database exports
-            create_table = self._extract_create_table_statement(table)
-            if create_table:
-                logger.info(f"Creating table {table}")
-                self.db.execute(create_table)
-            
-            # Import data
-            data_file = os.path.join(self.config.input_dir, f"{table}_data.sql")
-            if Path(data_file).exists():
-                logger.info(f"Importing data for table {table}")
-                rows = self.db.import_table_data(table, data_file, self.config.batch_size)
-                logger.info(f"Inserted {rows} rows into table {table}")
+            # Apply delimiter handling logic
+            sql_statements = self._split_sql_statements(file_content)
+            if not sql_statements:
+                self.logger.warning(f"No SQL statements found in file {file_path}")
+                result['warning'] = True
+                result['success'] = True
+                return result
                 
-        except Exception as e:
-            raise ImportError(f"Failed to import table {table}: {str(e)}")
+            # Use the enhanced SQL statement processor
+            context = {
+                'file_path': file_path,
+                'file_name': filename
+            }
             
-    def _extract_create_table_statement(self, table_name: str) -> Optional[str]:
-        """Extract CREATE TABLE statement from SQL file."""
-        # Read the schema file
-        schema_file = os.path.join(self.config.input_dir, f"{table_name}.sql")
-        if not Path(schema_file).exists():
-            logger.warning(f"Schema file not found for table {table_name}")
-            return None
+            import_result = self._import_sql_statements(sql_statements, file_path, context)
             
-        try:
-            with open(schema_file, 'r', encoding='utf-8') as f:
-                content = f.read()
+            # Update our result based on the import result
+            if not import_result['success']:
+                if import_result['warnings'] and self.config.continue_on_error:
+                    result['warning'] = True
+                    result['success'] = True
+                    self.logger.warning(f"Warnings executing SQL in {filename}: {', '.join(import_result['warnings'])}")
+                else:
+                    result['error'] = "; ".join(import_result['errors'])
+                    self.logger.error(f"Errors executing SQL in {filename}: {result['error']}")
+                    return result
+            else:
+                result['success'] = True
+                if import_result['warnings']:
+                    result['warning'] = True
                 
-            # Extract CREATE TABLE statement
-            match = re.search(r'CREATE\s+TABLE.*?;', content, re.IGNORECASE | re.DOTALL)
-            if match:
-                return match.group(0)
+            # Calculate execution time
+            execution_time = time.time() - start_time
+            result['execution_time'] = execution_time
                 
-            logger.warning(f"CREATE TABLE statement not found in {schema_file}")
-            return None
+            self.logger.info(f"Successfully imported {filename} ({import_result['statements_executed']} statements) in {execution_time:.2f}s")
+            return result
             
         except Exception as e:
-            logger.error(f"Error reading schema file {schema_file}: {str(e)}")
-            return None
+            self.logger.error(f"Error importing file {file_path}: {str(e)}")
+            result['error'] = f"Error importing file: {str(e)}"
+            return result
+
+    def _split_sql_statements(self, content: str) -> List[str]:
+        """Split SQL content into individual statements, handling DELIMITER directives.
+        
+        Args:
+            content: SQL content to split
+            
+        Returns:
+            List of SQL statements
+        """
+        statements = []
+        current_statement = []
+        delimiter = ";"
+        in_string = False
+        string_char = None
+        in_comment = False
+        escaped = False
+        in_delimiter_directive = False
+        
+        # First check if there are DELIMITER directives in the content
+        has_delimiter_directives = re.search(r'^\s*DELIMITER\s+', content, re.IGNORECASE | re.MULTILINE) is not None
+        
+        # If this is likely a stored procedure, function, trigger or event but has no DELIMITER directives,
+        # we'll handle them differently
+        is_special_object = (
+            re.search(r'CREATE\s+(?:DEFINER\s*=\s*[^\s]+\s+)?PROCEDURE', content, re.IGNORECASE) or
+            re.search(r'CREATE\s+(?:DEFINER\s*=\s*[^\s]+\s+)?FUNCTION', content, re.IGNORECASE) or
+            re.search(r'CREATE\s+(?:DEFINER\s*=\s*[^\s]+\s+)?TRIGGER', content, re.IGNORECASE) or
+            re.search(r'CREATE\s+(?:DEFINER\s*=\s*[^\s]+\s+)?EVENT', content, re.IGNORECASE)
+        ) is not None
+        
+        if is_special_object and not has_delimiter_directives:
+            self.logger.info("Found special object without DELIMITER directives, will add them automatically")
+            # Just return the content as a single statement and let _import_sql_statements add delimiters
+            return [content]
+        
+        lines = content.split('\n')
+        
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            i += 1
+            
+            # Check for DELIMITER directive
+            if line.upper().startswith('DELIMITER '):
+                in_delimiter_directive = True
+                # Complete current statement if any
+                if current_statement:
+                    stmt = '\n'.join(current_statement).strip()
+                    if stmt:
+                        statements.append(stmt)
+                    current_statement = []
+                
+                # Set new delimiter and add the DELIMITER directive as its own statement
+                delimiter = line[10:].strip()
+                statements.append(line)
+                self.logger.debug(f"Found DELIMITER directive, new delimiter: '{delimiter}'")
+                continue
+            
+            # Special case: handle a line that is just the delimiter (common in exports)
+            if line == delimiter and delimiter != ';':
+                # This often means the end of a procedure/function/trigger/event
+                # Add the line to the current statement
+                current_statement.append(line)
+                
+                # Complete the statement
+                stmt = '\n'.join(current_statement).strip()
+                if stmt:
+                    statements.append(stmt)
+                
+                # Start a new statement
+                current_statement = []
+                continue
+            
+            # Skip empty lines and comments when not in a statement
+            if not current_statement and (not line or line.startswith('--') or line.startswith('#')):
+                continue
+            
+            # Add comments to current statement
+            if not current_statement and (line.startswith('--') or line.startswith('#')):
+                current_statement.append(line)
+                continue
+            
+            # Process line character by character
+            j = 0
+            while j < len(line):
+                char = line[j]
+                next_char = line[j+1] if j+1 < len(line) else None
+                
+                # Handle escape character
+                if char == '\\' and not escaped:
+                    escaped = True
+                    j += 1
+                    continue
+                
+                # Handle string literals
+                if not in_comment and (char == "'" or char == '"') and not escaped:
+                    if not in_string:
+                        in_string = True
+                        string_char = char
+                    elif string_char == char:
+                        in_string = False
+                
+                # Handle comments
+                if not in_string and not in_comment and char == '-' and next_char == '-':
+                    in_comment = True
+                    j += 2
+                    continue
+                elif not in_string and not in_comment and char == '#':
+                    in_comment = True
+                    j += 1
+                    continue
+                elif not in_string and not in_comment and char == '/' and next_char == '*':
+                    in_comment = True
+                    j += 2
+                    continue
+                elif in_comment and char == '*' and next_char == '/':
+                    in_comment = False
+                    j += 2
+                    continue
+                
+                # Handle end of line (reset line comment)
+                if j == len(line) - 1:
+                    if char != '\\':  # Not a continued line
+                        in_comment = False if in_comment and not in_comment == 'block' else in_comment
+                
+                # Check for delimiter
+                if not in_string and not in_comment and not escaped:
+                    # If we found the delimiter
+                    if j + len(delimiter) <= len(line) and line[j:j+len(delimiter)] == delimiter:
+                        # Add current line up to delimiter
+                        current_statement.append(line[:j+len(delimiter)])
+                        
+                        # Complete the statement
+                        stmt = '\n'.join(current_statement).strip()
+                        if stmt:
+                            # Remove the delimiter from the end if it's not a special directive
+                            if stmt.endswith(delimiter) and not stmt.upper().startswith('DELIMITER '):
+                                stmt = stmt[:-len(delimiter)]
+                            statements.append(stmt)
+                        
+                        # Start a new statement with the rest of the line
+                        current_statement = [line[j+len(delimiter):]]
+                        break
+                
+                # Reset escape flag
+                escaped = False
+                j += 1
+            
+            # If we didn't find a delimiter, add the whole line
+            if j >= len(line):
+                current_statement.append(line)
+        
+        # Add the last statement if any
+        if current_statement:
+            stmt = '\n'.join(current_statement).strip()
+            if stmt and not stmt.upper().startswith('DELIMITER '):
+                statements.append(stmt)
+                
+        # Special processing for DELIMITER statements to ensure they're properly paired
+        processed_statements = []
+        change_delimiter = None
+        
+        for stmt in statements:
+            if stmt.upper().startswith('DELIMITER '):
+                # This is a delimiter change directive
+                if change_delimiter is None:
+                    # Start a new delimiter change
+                    change_delimiter = stmt
+                    processed_statements.append(stmt)
+                else:
+                    # End a delimiter change by returning to standard delimiter
+                    if stmt.strip().upper() == 'DELIMITER ;':
+                        change_delimiter = None
+                        processed_statements.append(stmt)
+                    else:
+                        # Unexpected delimiter change - handle it anyway
+                        self.logger.warning(f"Unexpected DELIMITER directive: {stmt}")
+                        processed_statements.append(stmt)
+                        change_delimiter = stmt
+            else:
+                processed_statements.append(stmt)
+        
+        # If we have an unclosed delimiter change, add a closing directive
+        if change_delimiter is not None:
+            self.logger.warning("Found unclosed DELIMITER directive, adding closing directive")
+            processed_statements.append("DELIMITER ;")
+            
+        self.logger.debug(f"Split SQL content into {len(processed_statements)} statements")
+        return processed_statements
+
+    def _import_sql_statements(self, statements: List[str], file_path: str = '', context: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Execute multiple SQL statements.
+        
+        Args:
+            statements: List of SQL statements to execute
+            file_path: Source file path
+            context: Additional context information
+            
+        Returns:
+            Dict with execution results
+        """
+        context = context or {}
+        results = {
+            'statements_total': len(statements),
+            'statements_executed': 0,
+            'errors': [],
+            'warnings': [],
+            'success': True
+        }
+        
+        current_delimiter = ";"
+        in_delimiter_block = False
+        
+        filename = os.path.basename(file_path).lower() if file_path else ''
+        
+        # Check if this is a special object file
+        is_procedure_file = "procedures.sql" in filename or any("CREATE PROCEDURE" in stmt.upper() for stmt in statements)
+        is_function_file = "functions.sql" in filename or any("CREATE FUNCTION" in stmt.upper() for stmt in statements)
+        is_trigger_file = "triggers.sql" in filename or any("CREATE TRIGGER" in stmt.upper() for stmt in statements)
+        is_event_file = "events.sql" in filename or any("CREATE EVENT" in stmt.upper() for stmt in statements)
+        is_view_file = "views.sql" in filename or any("CREATE VIEW" in stmt.upper() for stmt in statements)
+        
+        # Log what we're importing for better debugging
+        self.logger.info(f"Importing from file: {filename} - Contains: " + 
+                         (", ".join(filter(None, [
+                             "procedures" if is_procedure_file else None,
+                             "functions" if is_function_file else None,
+                             "triggers" if is_trigger_file else None,
+                             "events" if is_event_file else None,
+                             "views" if is_view_file else None
+                         ])) or "regular SQL"))
+        
+        # Pre-process statements with special delimiter handling for procedure-like objects
+        is_special_file = is_procedure_file or is_function_file or is_trigger_file or is_event_file
+        
+        # Find and pre-process special objects that need delimiter handling
+        if is_special_file:
+            # First remove any existing DELIMITER statements - we'll handle them manually
+            filtered_statements = []
+            preprocess_needed = False
+            
+            for i, stmt in enumerate(statements):
+                if stmt.upper().startswith("DELIMITER "):
+                    # Skip delimiter statements - we'll add our own
+                    preprocess_needed = True
+                    in_delimiter_block = True
+                    continue
+                elif in_delimiter_block and (i+1 < len(statements) and statements[i+1].upper().startswith("DELIMITER ;")):
+                    # This statement is the last one before a DELIMITER reset
+                    # It should be combined with previous statements
+                    in_delimiter_block = False
+                    continue
+                else:
+                    filtered_statements.append(stmt)
+            
+            # Process special object definitions
+            processed_statements = []
+            for stmt in filtered_statements:
+                stmt = stmt.strip()
+                if stmt and ("CREATE PROCEDURE" in stmt.upper() or 
+                           "CREATE FUNCTION" in stmt.upper() or
+                           "CREATE TRIGGER" in stmt.upper() or
+                           "CREATE EVENT" in stmt.upper()):
+                    
+                    # This is a special statement that needs DELIMITER handling
+                    # Add the drop statement if it's not already there
+                    object_match = re.search(r'CREATE\s+(?:DEFINER\s*=\s*[^\s]+\s+)?(?:PROCEDURE|FUNCTION|TRIGGER|EVENT)\s+`?([^`\s(]+)', stmt, re.IGNORECASE)
+                    if object_match:
+                        object_name = object_match.group(1)
+                        object_type = re.search(r'CREATE\s+(?:DEFINER\s*=\s*[^\s]+\s+)?(PROCEDURE|FUNCTION|TRIGGER|EVENT)', stmt, re.IGNORECASE).group(1)
+                        
+                        # First add a drop statement
+                        drop_stmt = f"DROP {object_type} IF EXISTS `{object_name}`"
+                        processed_statements.append(drop_stmt)
+                        
+                        # For MariaDB, we need to add special delimiter handling and execute separately
+                        self.logger.info(f"Adding delimiter handling for {object_type} {object_name}")
+                        
+                        # Execute the drop statement first
+                        try:
+                            self.db.execute(drop_stmt)
+                            results['statements_executed'] += 1
+                            self.logger.debug(f"Executed drop statement: {drop_stmt}")
+                        except Exception as e:
+                            self.logger.warning(f"Error dropping {object_type.lower()} {object_name}: {e}")
+                        
+                        # Then execute the create statement with a custom delimiter
+                        try:
+                            # We need to use the direct connection to execute with a custom delimiter
+                            self.logger.debug(f"Executing {object_type} creation with custom delimiter")
+                            
+                            # Special handling for MariaDB - use the raw cursor directly
+                            cursor = self.db.connection.cursor()
+                            
+                            # Set the delimiter
+                            cursor.execute("DELIMITER //")
+                            
+                            # Execute the create statement
+                            cursor.execute(stmt + " //")
+                            
+                            # Reset the delimiter
+                            cursor.execute("DELIMITER ;")
+                            
+                            cursor.close()
+                            
+                            results['statements_executed'] += 1
+                            self.logger.info(f"Successfully created {object_type.lower()} {object_name}")
+                        except Exception as e:
+                            error_msg = str(e)
+                            self.logger.error(f"Error creating {object_type.lower()} {object_name}: {error_msg}")
+                            results['warnings'].append(f"Error creating {object_type.lower()} {object_name}: {error_msg}")
+                            
+                            # Special handling for undeclared variables
+                            if "undeclared variable" in error_msg.lower():
+                                var_match = re.search(r'undeclared variable: ([a-zA-Z0-9_]+)', error_msg, re.IGNORECASE)
+                                if var_match:
+                                    var_name = var_match.group(1)
+                                    self.logger.warning(f"Attempting to fix undeclared variable: {var_name}")
+                                    
+                                    # Try adding a declaration for the variable and re-execute
+                                    begin_match = re.search(r'\bBEGIN\b', stmt, re.IGNORECASE)
+                                    if begin_match:
+                                        begin_pos = begin_match.start()
+                                        declaration = f"\nDECLARE {var_name} INT DEFAULT 0;\n"
+                                        fixed_stmt = stmt[:begin_pos] + declaration + stmt[begin_pos:]
+                                        
+                                        try:
+                                            # Try again with the fixed statement
+                                            cursor = self.db.connection.cursor()
+                                            cursor.execute("DELIMITER //")
+                                            cursor.execute(fixed_stmt + " //")
+                                            cursor.execute("DELIMITER ;")
+                                            cursor.close()
+                                            
+                                            results['statements_executed'] += 1
+                                            self.logger.info(f"Fixed and created {object_type.lower()} {object_name}")
+                                        except Exception as e2:
+                                            error_msg = str(e2)
+                                            self.logger.error(f"Error fixing {object_type.lower()} {object_name}: {error_msg}")
+                                            results['warnings'].append(f"Error fixing {object_type.lower()} {object_name}: {error_msg}")
+                    else:
+                        # Add the statement as-is if we can't parse it
+                        processed_statements.append(stmt)
+                else:
+                    # Add regular statements as-is
+                    processed_statements.append(stmt)
+            
+            if processed_statements:
+                # Update statements to the processed ones
+                statements = processed_statements
+                self.logger.debug(f"Preprocessed statements for special objects, now have {len(statements)} statements")
+            
+            # Skip the rest of normal execution since we've already executed special objects
+            return results
+        
+        # Process each statement for regular SQL (non-special objects)
+        i = 0
+        while i < len(statements):
+            stmt = statements[i].strip()
+            i += 1
+            
+            # Skip empty statements
+            if not stmt:
+                continue
+                
+            try:
+                # Log the statement being executed (first 100 chars to avoid huge logs)
+                self.logger.debug(f"Executing statement: {stmt[:100]}..." if len(stmt) > 100 else f"Executing statement: {stmt}")
+                
+                # Execute the SQL statement
+                self.db.execute(stmt)
+                results['statements_executed'] += 1
+                self.logger.debug(f"Executed statement {results['statements_executed']}/{results['statements_total']}")
+                
+            except Exception as e:
+                error_msg = str(e)
+                
+                # Check if it's a duplicate object error and mode is SKIP
+                if self.config.mode == ImportMode.SKIP and (
+                    "already exists" in error_msg.lower() or
+                    "duplicate" in error_msg.lower()
+                ):
+                    if self.config.continue_on_error:
+                        results['warnings'].append(f"Skipped: {error_msg}")
+                        self.logger.warning(f"Skipped existing object: {error_msg}")
+                        continue
+                    else:
+                        results['errors'].append(f"Object already exists: {error_msg}")
+                        results['success'] = False
+                        break
+                
+                # If in CONTINUE_ON_ERROR mode, log the error but don't stop
+                if self.config.continue_on_error:
+                    results['warnings'].append(error_msg)
+                    self.logger.warning(f"Error executing SQL: {error_msg}")
+                else:
+                    results['errors'].append(error_msg)
+                    results['success'] = False
+                    self.logger.error(f"Error executing SQL: {error_msg}")
+                    break
+            
+        return results
 
     def _force_drop_database_objects(self, has_tables: bool, has_triggers: bool, has_procedures: bool, has_views: bool, has_events: bool, has_functions: bool, has_user_types: bool) -> None:
         """Force drop specific database objects being imported.
@@ -1001,7 +1620,7 @@ class ImportService:
         user_types_to_drop = []
         
         # First pass: identify objects to be imported
-        for file in self.files:
+        for file in self.import_files:
             filename = os.path.basename(file).lower()
             
             # Extract table names from schema files
@@ -1146,167 +1765,245 @@ class ImportService:
                 self.db.execute("SET FOREIGN_KEY_CHECKS = 1")
             except:
                 pass
-            raise
 
     def _handle_overwrite_mode(self, table_schema_files: List[str]) -> None:
-        """Handle OVERWRITE mode by truncating tables instead of dropping them."""
-        self.logger.info("Handling OVERWRITE mode by truncating tables")
+        """Handle OVERWRITE mode by dropping tables properly."""
+        self.logger.info("Handling OVERWRITE mode - dropping objects before recreating them")
         
-        # Get the current tables in the database
         try:
+            # Get current tables in the database
             current_tables = self.db.get_table_names()
             if not current_tables:
-                self.logger.info("No existing tables to truncate")
+                self.logger.info("No existing tables to drop")
                 return
-                
+            
             # Extract table names from schema files
             table_names = []
             for file_path in table_schema_files:
                 filename = os.path.basename(file_path)
                 table_name = filename.replace('_schema.sql', '')
                 table_names.append(table_name)
-                
-            # Find tables that exist both in the database and in our import list
-            tables_to_truncate = [table for table in current_tables if table in table_names]
             
-            if not tables_to_truncate:
-                self.logger.info("No matching tables to truncate")
+            # Find tables that exist both in the database and in our import list
+            tables_to_drop = [table for table in current_tables if table in table_names]
+            
+            if not tables_to_drop:
+                self.logger.info("No matching tables to drop")
                 return
-                
-            self.logger.info(f"Truncating {len(tables_to_truncate)} tables")
+            
+            self.logger.info(f"Will drop {len(tables_to_drop)} tables and their associated constraints")
             
             # Disable foreign key checks to avoid constraint errors
             self.db.execute("SET FOREIGN_KEY_CHECKS = 0")
             
-            # Truncate each table
-            for table in tables_to_truncate:
-                self.logger.info(f"Truncating table {table}")
-                self.db.execute(f"TRUNCATE TABLE `{table}`")
+            # First drop all foreign key constraints from ALL tables in the database
+            # This is necessary because constraints might reference tables we're trying to drop
+            try:
+                self.logger.info("Dropping all foreign key constraints that reference tables being imported")
+                query = """
+                    SELECT DISTINCT
+                        tc.TABLE_NAME, 
+                        tc.CONSTRAINT_NAME
+                    FROM 
+                        INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+                    JOIN 
+                        INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu 
+                    ON 
+                        tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME 
+                        AND tc.TABLE_SCHEMA = kcu.TABLE_SCHEMA
+                    WHERE 
+                        tc.CONSTRAINT_TYPE = 'FOREIGN KEY'
+                        AND tc.TABLE_SCHEMA = DATABASE()
+                """
+                
+                all_constraints = self.db.execute_query(query)
+                if all_constraints:
+                    for constraint in all_constraints:
+                        table_name = constraint['TABLE_NAME']
+                        constraint_name = constraint['CONSTRAINT_NAME']
+                        try:
+                            self.db.execute(f"ALTER TABLE `{table_name}` DROP FOREIGN KEY `{constraint_name}`")
+                            self.logger.debug(f"Dropped foreign key constraint {constraint_name} from table {table_name}")
+                        except Exception as e:
+                            self.logger.warning(f"Error dropping constraint {constraint_name}: {str(e)}")
+            except Exception as e:
+                self.logger.warning(f"Error dropping foreign key constraints: {str(e)}")
+            
+            # Now drop the tables
+            for table in tables_to_drop:
+                try:
+                    # Drop all indexes except PRIMARY on the table
+                    try:
+                        query = f"""
+                            SELECT INDEX_NAME 
+                            FROM INFORMATION_SCHEMA.STATISTICS 
+                            WHERE TABLE_SCHEMA = DATABASE() 
+                            AND TABLE_NAME = '{table}'
+                            AND INDEX_NAME != 'PRIMARY'
+                        """
+                        indexes = self.db.execute_query(query)
+                        for index in indexes:
+                            index_name = index['INDEX_NAME']
+                            try:
+                                self.db.execute(f"ALTER TABLE `{table}` DROP INDEX `{index_name}`")
+                                self.logger.debug(f"Dropped index {index_name} from table {table}")
+                            except Exception as e:
+                                self.logger.warning(f"Error dropping index {index_name}: {str(e)}")
+                    except Exception as e:
+                        self.logger.warning(f"Error getting or dropping indexes for table {table}: {str(e)}")
+                    
+                    # Now drop the table
+                    self.logger.info(f"Dropping table {table}")
+                    self.db.execute(f"DROP TABLE IF EXISTS `{table}`")
+                except Exception as e:
+                    self.logger.warning(f"Error dropping table {table}: {str(e)}")
                 
             # Re-enable foreign key checks
             self.db.execute("SET FOREIGN_KEY_CHECKS = 1")
             
-            self.logger.info(f"Successfully truncated {len(tables_to_truncate)} tables")
+            self.logger.info(f"Successfully prepared database for importing {len(tables_to_drop)} tables")
             
         except Exception as e:
             self.logger.error(f"Error handling OVERWRITE mode: {str(e)}")
-            # Continue with import even if truncation fails 
+            # Continue with import even if dropping fails, but warn the user
+            self.logger.warning("Continuing with import despite dropping errors - you may see duplicate key errors")
+            # Re-enable foreign key checks in case of an error
+            try:
+                self.db.execute("SET FOREIGN_KEY_CHECKS = 1")
+            except:
+                pass
 
-    def _split_sql_statements(self, content: str) -> List[str]:
-        """Split SQL content into individual statements, handling DELIMITER directives.
+    def _execute_create_procedure(self, content, result):
+        """Execute CREATE PROCEDURE statements in a more robust way
+        
+        This method specifically handles procedure creation by:
+        1. Extracting procedure definitions
+        2. Adding DROP statements
+        3. Handling multi-statement procedures with DELIMITER
+        4. Fixing common errors
         
         Args:
-            content: SQL content to split
+            content: SQL content containing procedure definitions
+            result: Result dictionary to update
             
         Returns:
-            List of SQL statements
+            Updated result dictionary
         """
-        statements = []
-        current_statement = []
-        delimiter = ";"
-        in_string = False
-        string_char = None
-        in_comment = False
-        escaped = False
+        self.logger.info("Using specialized procedure executor")
         
-        lines = content.split('\n')
+        # Remove comments and empty lines
+        content_lines = []
+        for line in content.splitlines():
+            if line.strip() and not line.strip().startswith('--'):
+                content_lines.append(line)
         
-        i = 0
-        while i < len(lines):
-            line = lines[i].strip()
-            i += 1
-            
-            # Check for DELIMITER directive
-            if line.upper().startswith('DELIMITER '):
-                # Complete current statement if any
-                if current_statement:
-                    stmt = '\n'.join(current_statement).strip()
-                    if stmt:
-                        statements.append(stmt)
-                    current_statement = []
+        processed_content = '\n'.join(content_lines)
+        
+        # Extract all procedure definitions
+        # This pattern is more permissive to capture many variations
+        proc_pattern = r'CREATE\s+(?:DEFINER\s*=\s*[^\s]+\s+)?PROCEDURE\s+`?([^`\s(]+)`?(?:\s*\([^)]*\))?(?:[\s\S]*?END|[\s\S]*?[^;]*;)'
+        procedures_found = 0
+        
+        for match in re.finditer(proc_pattern, processed_content, re.IGNORECASE | re.DOTALL):
+            try:
+                proc_name = match.group(1)
+                proc_def = match.group(0).strip()
+                self.logger.info(f"Found procedure: {proc_name}")
                 
-                # Set new delimiter
-                delimiter = line[10:].strip()
-                continue
-            
-            # Skip empty lines and comments
-            if not line or line.startswith('--') or line.startswith('#'):
-                current_statement.append(line)
-                continue
-            
-            # Process line character by character
-            j = 0
-            while j < len(line):
-                char = line[j]
-                next_char = line[j+1] if j+1 < len(line) else None
+                # First drop the procedure if it exists
+                try:
+                    self.db.execute(f"DROP PROCEDURE IF EXISTS `{proc_name}`")
+                    self.logger.debug(f"Dropped existing procedure: {proc_name}")
+                except Exception as drop_e:
+                    self.logger.warning(f"Could not drop procedure {proc_name}: {str(drop_e)}")
                 
-                # Handle escape character
-                if char == '\\' and not escaped:
-                    escaped = True
-                    j += 1
-                    continue
+                # Add delimiter markers for multi-statement procedures
+                has_multiple_statements = "BEGIN" in proc_def.upper() and "END" in proc_def.upper()
                 
-                # Handle string literals
-                if not in_comment and (char == "'" or char == '"') and not escaped:
-                    if not in_string:
-                        in_string = True
-                        string_char = char
-                    elif string_char == char:
-                        in_string = False
-                
-                # Handle comments
-                if not in_string and not in_comment and char == '-' and next_char == '-':
-                    in_comment = True
-                    j += 2
-                    continue
-                elif not in_string and not in_comment and char == '#':
-                    in_comment = True
-                    j += 1
-                    continue
-                elif not in_string and not in_comment and char == '/' and next_char == '*':
-                    in_comment = True
-                    j += 2
-                    continue
-                elif in_comment and char == '*' and next_char == '/':
-                    in_comment = False
-                    j += 2
-                    continue
-                
-                # Handle end of line (reset line comment)
-                if j == len(line) - 1:
-                    in_comment = False
-                
-                # Check for delimiter
-                if not in_string and not in_comment and not escaped:
-                    # If we found the delimiter
-                    if line[j:j+len(delimiter)] == delimiter:
-                        # Add current line up to delimiter
-                        current_statement.append(line[:j+len(delimiter)])
+                if has_multiple_statements:
+                    # Make sure the procedure ends with END
+                    if not re.search(r'END\s*;?\s*$', proc_def):
+                        proc_def = proc_def.rstrip(';') + "\nEND;"
+                    
+                    try:
+                        # Try with DELIMITER approach
+                        with self.db.connection.cursor() as cursor:
+                            # Set delimiter
+                            cursor.execute("DELIMITER //")
+                            
+                            # Replace existing delimiter if present
+                            proc_to_execute = proc_def.rstrip(';') + " //"
+                            
+                            # Execute
+                            self.logger.debug(f"Executing procedure with DELIMITER: {proc_name}")
+                            cursor.execute(proc_to_execute)
+                            
+                            # Reset delimiter
+                            cursor.execute("DELIMITER ;")
                         
-                        # Complete the statement
-                        stmt = '\n'.join(current_statement).strip()
-                        if stmt:
-                            # Remove the delimiter from the end
-                            if stmt.endswith(delimiter):
-                                stmt = stmt[:-len(delimiter)]
-                            statements.append(stmt)
-                        
-                        # Start a new statement with the rest of the line
-                        current_statement = [line[j+len(delimiter):]]
-                        break
+                        self.logger.info(f"Successfully created procedure {proc_name}")
+                        procedures_found += 1
+                        continue
+                    except Exception as delimiter_e:
+                        self.logger.warning(f"DELIMITER approach failed: {str(delimiter_e)}")
                 
-                # Reset escape flag
-                escaped = False
-                j += 1
-            
-            # If we didn't find a delimiter, add the whole line
-            if j >= len(line):
-                current_statement.append(line)
+                # If we get here, try direct execution
+                try:
+                    self.logger.debug(f"Trying direct execution for procedure {proc_name}")
+                    self.db.execute(proc_def)
+                    self.logger.info(f"Successfully created procedure {proc_name}")
+                    procedures_found += 1
+                except Exception as direct_e:
+                    error_msg = str(direct_e)
+                    self.logger.error(f"Error creating procedure {proc_name}: {error_msg}")
+                    
+                    # Try to fix common errors
+                    if "undeclared variable" in error_msg.lower():
+                        try:
+                            # Try to extract the variable name
+                            var_match = re.search(r"Undeclared variable: (\w+)", error_msg, re.IGNORECASE)
+                            if var_match:
+                                var_name = var_match.group(1)
+                                self.logger.info(f"Attempting to fix undeclared variable: {var_name}")
+                                
+                                # Add a DECLARE statement for this variable after BEGIN
+                                modified_def = re.sub(
+                                    r'(BEGIN\s+)',
+                                    f'\\1DECLARE {var_name} INT DEFAULT 0;\n',
+                                    proc_def,
+                                    flags=re.IGNORECASE
+                                )
+                                
+                                with self.db.connection.cursor() as cursor:
+                                    # Set delimiter
+                                    cursor.execute("DELIMITER //")
+                                    
+                                    # Execute with added variable declaration
+                                    proc_to_execute = modified_def.rstrip(';') + " //"
+                                    cursor.execute(proc_to_execute)
+                                    
+                                    # Reset delimiter
+                                    cursor.execute("DELIMITER ;")
+                                
+                                self.logger.info(f"Successfully created procedure {proc_name} after fixing variable")
+                                procedures_found += 1
+                                continue
+                        except Exception as var_e:
+                            self.logger.error(f"Failed to fix undeclared variable: {str(var_e)}")
+                    
+                    # If all fixes failed, add to errors
+                    result['errors'].append(f"Error creating procedure {proc_name}: {error_msg}")
+            except Exception as e:
+                self.logger.error(f"Error processing procedure: {str(e)}")
         
-        # Add the last statement if any
-        if current_statement:
-            stmt = '\n'.join(current_statement).strip()
-            if stmt and not stmt.upper().startswith('DELIMITER '):
-                statements.append(stmt)
+        # Update the result
+        result['statements_executed'] += procedures_found
+        result['statements_total'] = max(result['statements_total'], procedures_found)
         
-        return statements 
+        if procedures_found == 0:
+            self.logger.warning("No procedures were created")
+            result['warnings'].append("No procedures were created")
+        else:
+            self.logger.info(f"Successfully created {procedures_found} procedures")
+        
+        return result

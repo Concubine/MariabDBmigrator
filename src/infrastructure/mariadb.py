@@ -1369,28 +1369,71 @@ class MariaDB(DatabaseInterface):
             return []
         
         try:
-            query = """
-            SELECT
-                EVENT_NAME AS name,
-                EVENT_DEFINITION AS body,
-                EVENT_SCHEDULE AS schedule_raw,
-                INTERVAL_VALUE AS interval_value,
-                INTERVAL_FIELD AS interval_field,
-                STARTS AS starts,
-                ENDS AS ends,
-                STATUS AS raw_status,
-                ON_COMPLETION AS on_completion,
-                CREATED AS created,
-                LAST_ALTERED AS last_altered,
-                LAST_EXECUTED AS last_executed,
-                EVENT_COMMENT AS comment
-            FROM
-                information_schema.EVENTS
-            WHERE
-                EVENT_SCHEMA = %s
-            ORDER BY
-                EVENT_NAME
-            """
+            # First check if the EVENTS table has the EVENT_SCHEDULE column
+            # This column might not exist in some MariaDB versions
+            has_event_schedule = True
+            try:
+                check_query = """
+                SELECT COLUMN_NAME
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = 'information_schema'
+                AND TABLE_NAME = 'EVENTS'
+                AND COLUMN_NAME = 'EVENT_SCHEDULE'
+                """
+                check_result = self.execute_query(check_query)
+                has_event_schedule = len(check_result) > 0
+            except Exception as check_e:
+                logger.warning(f"Could not check for EVENT_SCHEDULE column: {str(check_e)}")
+                has_event_schedule = False
+            
+            # Prepare query based on column availability
+            if has_event_schedule:
+                query = """
+                SELECT
+                    EVENT_NAME AS name,
+                    EVENT_DEFINITION AS body,
+                    EVENT_SCHEDULE AS schedule_raw,
+                    INTERVAL_VALUE AS interval_value,
+                    INTERVAL_FIELD AS interval_field,
+                    STARTS AS starts,
+                    ENDS AS ends,
+                    STATUS AS raw_status,
+                    ON_COMPLETION AS on_completion,
+                    CREATED AS created,
+                    LAST_ALTERED AS last_altered,
+                    LAST_EXECUTED AS last_executed,
+                    EVENT_COMMENT AS comment
+                FROM
+                    information_schema.EVENTS
+                WHERE
+                    EVENT_SCHEMA = %s
+                ORDER BY
+                    EVENT_NAME
+                """
+            else:
+                # Fallback query without EVENT_SCHEDULE column
+                logger.info("Using fallback query for EVENTS without EVENT_SCHEDULE column")
+                query = """
+                SELECT
+                    EVENT_NAME AS name,
+                    EVENT_DEFINITION AS body,
+                    INTERVAL_VALUE AS interval_value,
+                    INTERVAL_FIELD AS interval_field,
+                    STARTS AS starts,
+                    ENDS AS ends,
+                    STATUS AS raw_status,
+                    ON_COMPLETION AS on_completion,
+                    CREATED AS created,
+                    LAST_ALTERED AS last_altered,
+                    LAST_EXECUTED AS last_executed,
+                    EVENT_COMMENT AS comment
+                FROM
+                    information_schema.EVENTS
+                WHERE
+                    EVENT_SCHEMA = %s
+                ORDER BY
+                    EVENT_NAME
+                """
             
             events = self.execute_query(query, (database,))
             
@@ -1398,7 +1441,7 @@ class MariaDB(DatabaseInterface):
             for i, event in enumerate(events):
                 # Format schedule
                 schedule = ""
-                if event.get('schedule_raw') == 'AT':
+                if has_event_schedule and event.get('schedule_raw') == 'AT':
                     # One-time event
                     if event.get('starts'):
                         schedule = f"AT '{event['starts']}'"
@@ -1544,7 +1587,27 @@ class MariaDB(DatabaseInterface):
             return []
         
         try:
-            # This query is specific to MariaDB's implementation of user-defined types
+            # First check if USER_DEFINED_TYPES table exists in information_schema
+            # This table might not exist in some MariaDB versions
+            has_udt_table = True
+            try:
+                check_query = """
+                SELECT TABLE_NAME
+                FROM INFORMATION_SCHEMA.TABLES 
+                WHERE TABLE_SCHEMA = 'information_schema'
+                AND TABLE_NAME = 'USER_DEFINED_TYPES'
+                """
+                check_result = self.execute_query(check_query)
+                has_udt_table = len(check_result) > 0
+            except Exception as check_e:
+                logger.warning(f"Could not check for USER_DEFINED_TYPES table: {str(check_e)}")
+                has_udt_table = False
+            
+            if not has_udt_table:
+                logger.warning("USER_DEFINED_TYPES table not available in this MariaDB version")
+                return []
+                
+            # If we get here, the table exists, so query it
             query = """
             SELECT
                 mdt.TYPE_NAME AS name,

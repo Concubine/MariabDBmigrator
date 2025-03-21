@@ -129,11 +129,11 @@ class ASCIIInterface:
         """Display a single import result in ASCII format."""
         # Define status symbols
         symbols = {
-            "success": "✓",
-            "warning": "⚠",
-            "error": "✗"
+            "success": "[OK]",
+            "warning": "[WARNING]",
+            "error": "[ERROR]"
         }
-        symbol = symbols.get(result.status, "?")
+        symbol = symbols.get(result.status, "[?]")
         
         # Create basic output
         if result.status == "success":
@@ -199,7 +199,7 @@ class ASCIIInterface:
             if warning_count > 0:
                 warning_tables = [r for r in results if r.status == "warning"]
                 for i, result in enumerate(warning_tables[:5]):  # Show max 5 warnings
-                    summary += f"⚠ {result.table_name}: {result.error_message}\n"
+                    summary += f"[WARNING] {result.table_name}: {result.error_message}\n"
                 if len(warning_tables) > 5:
                     summary += f"...and {len(warning_tables) - 5} more tables with warnings\n"
             
@@ -207,7 +207,7 @@ class ASCIIInterface:
             if error_count > 0:
                 error_tables = [r for r in results if r.status == "error"]
                 for i, result in enumerate(error_tables[:5]):  # Show max 5 errors
-                    summary += f"✗ {result.table_name}: {result.error_message}\n"
+                    summary += f"[ERROR] {result.table_name}: {result.error_message}\n"
                 if len(error_tables) > 5:
                     summary += f"...and {len(error_tables) - 5} more tables with errors\n"
         

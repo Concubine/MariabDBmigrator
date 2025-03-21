@@ -113,6 +113,14 @@ class ImportConfig:
     import_events: bool
     import_functions: bool
     import_user_types: bool
+    exclude_tables: List[str]
+    exclude_data: List[str]
+    exclude_triggers: bool
+    exclude_procedures: bool
+    exclude_views: bool
+    exclude_events: bool
+    exclude_functions: bool
+    exclude_user_types: bool
     database: str = ""  # Target database for import
     force_drop: bool = False  # Whether to force drop existing database objects before importing
 
@@ -125,6 +133,10 @@ class ImportConfig:
                  import_triggers: bool = True, import_procedures: bool = True,
                  import_views: bool = True, import_events: bool = True,
                  import_functions: bool = True, import_user_types: bool = True,
+                 exclude_tables: List[str] = None, exclude_data: List[str] = None,
+                 exclude_triggers: bool = False, exclude_procedures: bool = False,
+                 exclude_views: bool = False, exclude_events: bool = False,
+                 exclude_functions: bool = False, exclude_user_types: bool = False,
                  force_drop: bool = False):
         self.input_dir = input_dir
         self.batch_size = batch_size
@@ -145,6 +157,14 @@ class ImportConfig:
         self.import_events = import_events
         self.import_functions = import_functions
         self.import_user_types = import_user_types
+        self.exclude_tables = exclude_tables or []
+        self.exclude_data = exclude_data or []
+        self.exclude_triggers = exclude_triggers
+        self.exclude_procedures = exclude_procedures
+        self.exclude_views = exclude_views
+        self.exclude_events = exclude_events
+        self.exclude_functions = exclude_functions
+        self.exclude_user_types = exclude_user_types
         self.force_drop = force_drop
     # SUGGESTION: Add option for data validation before import
     # SUGGESTION: Add option for data transformation during import (mapping values)
@@ -280,6 +300,14 @@ def load_config(config_file: Optional[Union[Path, str]] = None) -> Config:
         import_events=import_config.get('import_events', True),
         import_functions=import_config.get('import_functions', True),
         import_user_types=import_config.get('import_user_types', True),
+        exclude_tables=import_config.get('exclude_tables', []),
+        exclude_data=import_config.get('exclude_data', []),
+        exclude_triggers=import_config.get('exclude_triggers', False),
+        exclude_procedures=import_config.get('exclude_procedures', False),
+        exclude_views=import_config.get('exclude_views', False),
+        exclude_events=import_config.get('exclude_events', False),
+        exclude_functions=import_config.get('exclude_functions', False),
+        exclude_user_types=import_config.get('exclude_user_types', False),
         force_drop=import_config.get('force_drop', False)
     )
     
