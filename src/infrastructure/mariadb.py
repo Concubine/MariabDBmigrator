@@ -8,6 +8,7 @@ import os
 import sys
 import importlib.util
 import getpass
+import re
 
 from src.core.exceptions import DatabaseError
 from src.core.logging import get_logger
@@ -312,11 +313,19 @@ patch_mysql_connector()
 
 class MariaDB(DatabaseInterface):
     """Implementation of MariaDB database operations."""
-    
+    @property
+    def config(self):
+        """Get the database configuration for backward compatibility.
+        
+        Returns:
+            Dict: The database configuration
+        """
+        return self._config
+
     def __init__(self, config: DatabaseConfig):
         """Initialize the MariaDB connection."""
         # For MySQL/MariaDB connections, we need to handle authentication properly
-        self.config = {
+        self._config = {
             'host': config.host,
             'port': config.port,
             'user': config.user,
@@ -326,11 +335,11 @@ class MariaDB(DatabaseInterface):
         
         # Only add database if it's not empty
         if hasattr(config, 'database') and config.database:
-            self.config['database'] = config.database
+            self._config['database'] = config.database
             
         # Only add auth_plugin if explicitly specified and not None
         if hasattr(config, 'auth_plugin') and config.auth_plugin:
-            self.config['auth_plugin'] = config.auth_plugin
+            self._config['auth_plugin'] = config.auth_plugin
             
         # SSL configuration
         ssl_options = {}
@@ -348,10 +357,10 @@ class MariaDB(DatabaseInterface):
                 
             # Add SSL options to config
             if ssl_options:
-                self.config['ssl_disabled'] = False
-                self.config['ssl'] = ssl_options
+                self._config['ssl_disabled'] = False
+                self._config['ssl'] = ssl_options
         else:
-            self.config['ssl_disabled'] = True
+            self._config['ssl_disabled'] = True
             logger.debug("SSL disabled for database connection")
             
         self._connection = None
@@ -361,6 +370,15 @@ class MariaDB(DatabaseInterface):
         os.environ['LC_ALL'] = 'C'
         
         self.discovered_config = None
+    
+    @property
+    def connection(self):
+        """Get the database connection.
+        
+        Returns:
+            mysql.connector.connection.MySQLConnection: The database connection
+        """
+        return self._connection
     
     def discover_mariadb_config(self) -> Dict[str, Any]:
         """Discover MariaDB server configuration by probing the server.
@@ -384,25 +402,25 @@ class MariaDB(DatabaseInterface):
         }
         
         # Check if SSL is disabled in config - if so, skip discovery
-        config_ssl_disabled = self.config.get('ssl_disabled', True)
+        config_ssl_disabled = self._config.get('ssl_disabled', True)
         if config_ssl_disabled:
             logger.debug("SSL is disabled in config, skipping SSL discovery")
             discovered_config['ssl_required'] = False
             discovered_config['server_supports_ssl'] = False
         
         # Check if password is empty and prompt if needed
-        if not self.config['password']:
+        if not self._config['password']:
             import getpass
-            prompt_text = f"Enter password for {self.config['user']}@{self.config['host']}: "
-            self.config['password'] = getpass.getpass(prompt_text)
+            prompt_text = f"Enter password for {self._config['user']}@{self._config['host']}: "
+            self._config['password'] = getpass.getpass(prompt_text)
             
         # Try to connect with minimal settings first (no database specified)
         minimal_config = {
-            'host': self.config['host'],
-            'port': self.config['port'],
-            'user': self.config['user'],
-            'password': self.config['password'],
-            'use_pure': self.config.get('use_pure', True),
+            'host': self._config['host'],
+            'port': self._config['port'],
+            'user': self._config['user'],
+            'password': self._config['password'],
+            'use_pure': self._config.get('use_pure', True),
             'connect_timeout': 10,  # Short timeout for discovery
             'ssl_disabled': config_ssl_disabled  # Use the value from the config
         }
@@ -453,10 +471,10 @@ class MariaDB(DatabaseInterface):
                     FROM mysql.user 
                     WHERE user = %s AND host = %s
                 """
-                host_patterns = ['%', 'localhost', '127.0.0.1', self.config['host']]
+                host_patterns = ['%', 'localhost', '127.0.0.1', self._config['host']]
                 
                 for host in host_patterns:
-                    temp_cursor.execute(query, (self.config['user'], host))
+                    temp_cursor.execute(query, (self._config['user'], host))
                     plugin_result = temp_cursor.fetchone()
                     if plugin_result:
                         plugin_name = plugin_result['plugin']
@@ -504,15 +522,15 @@ class MariaDB(DatabaseInterface):
             return
         
         # Check if password is empty and prompt if needed
-        if not self.config['password']:
-            prompt_text = f"Enter password for {self.config['user']}@{self.config['host']}: "
-            self.config['password'] = getpass.getpass(prompt_text)
+        if not self._config['password']:
+            prompt_text = f"Enter password for {self._config['user']}@{self._config['host']}: "
+            self._config['password'] = getpass.getpass(prompt_text)
         
         # Simplified connection approach - try direct connection first 
         # This is based on what worked in our manual export script
         try:
-            logger.info(f"Connecting to MariaDB at {self.config['host']}:{self.config['port']} as {self.config['user']}")
-            self._connection = mysql.connector.connect(**self.config)
+            logger.info(f"Connecting to MariaDB at {self._config['host']}:{self._config['port']} as {self._config['user']}")
+            self._connection = mysql.connector.connect(**self._config)
             logger.info("Successfully connected to MariaDB")
             self._cursor = self._connection.cursor(dictionary=True)
             return
@@ -522,7 +540,7 @@ class MariaDB(DatabaseInterface):
             
         # If direct connection fails, try the existing approach with multiple authentication methods
         # Get the ssl_disabled value from the config
-        config_ssl_disabled = self.config.get('ssl_disabled', True)
+        config_ssl_disabled = self._config.get('ssl_disabled', True)
             
         # Try to discover server configuration first, but only if SSL isn't disabled in config
         if config_ssl_disabled:
@@ -544,8 +562,8 @@ class MariaDB(DatabaseInterface):
             auth_plugins.append(self.discovered_config['auth_plugin_discovered'])
             
         # If a specific auth plugin was configured, add it next
-        if 'auth_plugin' in self.config and self.config['auth_plugin'] not in auth_plugins:
-            auth_plugins.append(self.config['auth_plugin'])
+        if 'auth_plugin' in self._config and self._config['auth_plugin'] not in auth_plugins:
+            auth_plugins.append(self._config['auth_plugin'])
             
         # Then add other discovered plugins
         if self.discovered_config:
@@ -596,12 +614,12 @@ class MariaDB(DatabaseInterface):
         for auth_plugin in auth_plugins:
             if auth_plugin is not None:
                 logger.debug(f"Attempting to connect with auth_plugin: {auth_plugin}")
-                current_config = self.config.copy()
+                current_config = self._config.copy()
                 current_config['auth_plugin'] = auth_plugin
                 current_config['ssl_disabled'] = ssl_disabled
             else:
                 logger.debug("Attempting to connect with auto-detected auth_plugin")
-                current_config = {k: v for k, v in self.config.items() if k != 'auth_plugin'}
+                current_config = {k: v for k, v in self._config.items() if k != 'auth_plugin'}
                 current_config['ssl_disabled'] = ssl_disabled
             
             try:
@@ -631,12 +649,12 @@ class MariaDB(DatabaseInterface):
             for auth_plugin in auth_plugins:
                 if auth_plugin is not None:
                     logger.debug(f"Attempting to connect with auth_plugin: {auth_plugin}")
-                    current_config = self.config.copy()
+                    current_config = self._config.copy()
                     current_config['auth_plugin'] = auth_plugin
                     current_config['ssl_disabled'] = ssl_disabled
                 else:
                     logger.debug("Attempting to connect with auto-detected auth_plugin")
-                    current_config = {k: v for k, v in self.config.items() if k != 'auth_plugin'}
+                    current_config = {k: v for k, v in self._config.items() if k != 'auth_plugin'}
                     current_config['ssl_disabled'] = ssl_disabled
                 
                 try:
@@ -661,11 +679,11 @@ class MariaDB(DatabaseInterface):
             try:
                 logger.debug("Trying minimal connection as last resort")
                 minimal_config = {
-                    'host': self.config['host'],
-                    'port': self.config['port'],
-                    'user': self.config['user'],
-                    'password': self.config['password'],  # This will have the prompted password if it was initially empty
-                    'database': self.config.get('database', ''),
+                    'host': self._config['host'],
+                    'port': self._config['port'],
+                    'user': self._config['user'],
+                    'password': self._config['password'],  # This will have the prompted password if it was initially empty
+                    'database': self._config.get('database', ''),
                     'use_pure': True,
                     'ssl_disabled': True,
                     'allow_local_infile': True,
@@ -716,7 +734,7 @@ class MariaDB(DatabaseInterface):
             self._ensure_connected()
             
             # Ensure we're querying the correct database
-            current_db = self.config.get('database', '')
+            current_db = self._config.get('database', '')
             if not current_db:
                 # If no database is selected, use INFORMATION_SCHEMA to list tables across all databases
                 logger.warning("No database selected, using INFORMATION_SCHEMA to list tables")
@@ -764,7 +782,7 @@ class MariaDB(DatabaseInterface):
                 WHERE TABLE_SCHEMA = %s
                 AND TABLE_NAME = %s
                 AND CONSTRAINT_NAME = 'PRIMARY'
-            """, (self.config['database'], table_name))
+            """, (self._config['database'], table_name))
             primary_key = [row['COLUMN_NAME'] for row in self._cursor.fetchall()]
             
             # Get foreign keys
@@ -777,7 +795,7 @@ class MariaDB(DatabaseInterface):
                 WHERE TABLE_SCHEMA = %s
                 AND TABLE_NAME = %s
                 AND REFERENCED_TABLE_NAME IS NOT NULL
-            """, (self.config['database'], table_name))
+            """, (self._config['database'], table_name))
             foreign_keys = [
                 {
                     'column': row['COLUMN_NAME'],
@@ -798,7 +816,7 @@ class MariaDB(DatabaseInterface):
                 AND TABLE_NAME = %s
                 AND INDEX_NAME != 'PRIMARY'
                 ORDER BY INDEX_NAME, SEQ_IN_INDEX
-            """, (self.config['database'], table_name))
+            """, (self._config['database'], table_name))
             indexes = []
             current_index = None
             for row in self._cursor.fetchall():
@@ -829,7 +847,7 @@ class MariaDB(DatabaseInterface):
                 AND tc.TABLE_NAME = %s
                 AND tc.CONSTRAINT_TYPE != 'PRIMARY KEY'
                 AND tc.CONSTRAINT_TYPE != 'FOREIGN KEY'
-            """, (self.config['database'], table_name))
+            """, (self._config['database'], table_name))
             constraints = []
             current_constraint = None
             for row in self._cursor.fetchall():
@@ -884,7 +902,7 @@ class MariaDB(DatabaseInterface):
                 WHERE TABLE_SCHEMA = %s
                 AND TABLE_NAME = %s
                 ORDER BY ORDINAL_POSITION
-            """, (self.config['database'], table_name))
+            """, (self._config['database'], table_name))
             
             return [
                 ColumnMetadata(
@@ -939,18 +957,42 @@ class MariaDB(DatabaseInterface):
         except Error as e:
             raise DatabaseError(f"Failed to get data from table {table_name}: {str(e)}")
     
-    def execute(self, query: str) -> None:
+    def execute(self, sql: str, params: Optional[Dict[str, Any]] = None) -> None:
         """Execute a SQL statement.
         
         Args:
-            query: SQL statement to execute
+            sql: SQL statement
+            params: Query parameters
+            
+        Raises:
+            Exception: If execution fails
         """
+        self._ensure_connected()
+        
+        # Check if we need to select a database first
+        if not self._connection.database and "CREATE DATABASE" not in sql.upper():
+            error_msg = "No database selected. Please select a database before executing queries."
+            logger.error(error_msg)
+            raise Exception(error_msg)
+        
+        # Check if this is a database selection statement
+        select_db_match = re.search(r'USE\s+(?:`)?([^`\s]+)(?:`)?', sql, re.IGNORECASE)
+        if select_db_match:
+            db_name = select_db_match.group(1)
+            self.select_database(db_name)
+            return
+        
+        # Execute the query
         try:
-            self._ensure_connected()
-            self._cursor.execute(query)
+            self._cursor.execute(sql, params)
             self._connection.commit()
-        except Error as e:
-            raise DatabaseError(f"Failed to execute query: {str(e)}")
+        except mysql.connector.Error as e:
+            logger.error(f"Error executing SQL: {e}")
+            logger.debug(f"SQL statement: {sql}")
+            if params:
+                logger.debug(f"Parameters: {params}")
+            self._connection.rollback()
+            raise Exception(f"Failed to execute SQL: {str(e)}")
 
     def execute_query(self, query: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """Execute a query and return the results.
@@ -991,36 +1033,72 @@ class MariaDB(DatabaseInterface):
         """Execute a batch of SQL statements.
         
         Args:
-            statements: The SQL statements to execute.
+            statements: List of SQL statements to execute
             
         Raises:
-            DatabaseError: If an error occurs during execution.
+            DatabaseError: If an error occurs during execution
         """
-        if not statements:
-            return
-            
-        if not self._connection or not self._connection.is_connected():
-            self.connect()
-            
-        # Create a dedicated cursor for batch operations
-        batch_cursor = None
         try:
-            batch_cursor = self._connection.cursor()
+            self._ensure_connected()
             
-            for statement in statements:
-                if statement.strip():  # Skip empty statements
-                    batch_cursor.execute(statement)
+            # Start transaction
+            self._connection.start_transaction()
             
+            # Execute statements
+            for stmt in statements:
+                try:
+                    self._cursor.execute(stmt)
+                except Error as e:
+                    # Rollback transaction on error
+                    self._connection.rollback()
+                    raise DatabaseError(f"Failed to execute statement: {str(e)}\nStatement: {stmt}")
+            
+            # Commit transaction
             self._connection.commit()
+            
         except Error as e:
-            if self._connection:
+            # Rollback transaction on error
+            try:
                 self._connection.rollback()
-            raise DatabaseError(f"Batch execution failed: {str(e)}")
-        finally:
-            # Always close the cursor
-            if batch_cursor:
-                batch_cursor.close()
-    
+            except:
+                pass
+            raise DatabaseError(f"Failed to execute batch: {str(e)}")
+            
+    def execute_many(self, query: str, params: List[List[Any]]) -> None:
+        """Execute a parameterized SQL query with multiple parameter sets.
+        
+        Args:
+            query: SQL query with placeholders
+            params: List of parameter sets to execute with the query
+            
+        Raises:
+            DatabaseError: If an error occurs during execution
+        """
+        try:
+            self._ensure_connected()
+            
+            # Start transaction
+            self._connection.start_transaction()
+            
+            try:
+                # Execute query with multiple parameter sets
+                self._cursor.executemany(query, params)
+                
+                # Commit transaction
+                self._connection.commit()
+            except Error as e:
+                # Rollback transaction on error
+                self._connection.rollback()
+                raise DatabaseError(f"Failed to execute parameterized query: {str(e)}\nQuery: {query}")
+            
+        except Error as e:
+            # Rollback transaction on error
+            try:
+                self._connection.rollback()
+            except:
+                pass
+            raise DatabaseError(f"Failed to execute batch query: {str(e)}")
+            
     def _format_value(self, value: Any) -> str:
         """Format a value for SQL insertion."""
         if value is None:
@@ -1061,7 +1139,7 @@ class MariaDB(DatabaseInterface):
                 FROM information_schema.tables
                 WHERE table_schema = %s
                 AND table_name = %s
-            """, (self.config['database'], table_name))
+            """, (self._config['database'], table_name))
             return self._cursor.fetchone()['count'] > 0
         except Error as e:
             raise DatabaseError(f"Failed to check if table {table_name} exists: {str(e)}")
@@ -1168,7 +1246,7 @@ class MariaDB(DatabaseInterface):
             self._ensure_connected()
             self._cursor.execute(f"USE `{database}`")
             # Update the database name in config
-            self.config['database'] = database
+            self._config['database'] = database
         except Error as e:
             raise DatabaseError(f"Failed to select database {database}: {str(e)}")
 
@@ -1197,4 +1275,335 @@ class MariaDB(DatabaseInterface):
             return result['count'] if result else 0
             
         except Error as e:
-            raise DatabaseError(f"Failed to get row count for table {table_name}: {str(e)}") 
+            raise DatabaseError(f"Failed to get row count for table {table_name}: {str(e)}")
+
+    def get_triggers(self) -> List[Dict[str, Any]]:
+        """Get all triggers in the current database.
+        
+        Returns:
+            List of trigger definitions as dictionaries
+        """
+        self._ensure_connected()
+        database = self.get_current_database()
+        
+        try:
+            query = """
+            SELECT
+                TRIGGER_NAME AS name,
+                EVENT_MANIPULATION AS event,
+                ACTION_TIMING AS timing,
+                EVENT_OBJECT_TABLE AS `table`,
+                ACTION_STATEMENT AS statement
+            FROM
+                information_schema.TRIGGERS
+            WHERE
+                TRIGGER_SCHEMA = %s
+            ORDER BY 
+                TRIGGER_NAME
+            """
+            
+            result = self.execute_query(query, (database,))
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error getting triggers: {str(e)}")
+            return []
+
+    def get_procedures(self) -> List[Dict[str, Any]]:
+        """Get all stored procedures in the current database.
+        
+        Returns:
+            List of stored procedure definitions as dictionaries
+        """
+        self._ensure_connected()
+        database = self.get_current_database()
+        
+        try:
+            # First get procedure names and parameters
+            query = """
+            SELECT
+                ROUTINE_NAME AS name,
+                ROUTINE_DEFINITION AS definition,
+                ROUTINE_COMMENT AS comment
+            FROM
+                information_schema.ROUTINES
+            WHERE
+                ROUTINE_SCHEMA = %s AND
+                ROUTINE_TYPE = 'PROCEDURE'
+            ORDER BY
+                ROUTINE_NAME
+            """
+            
+            procedures = self.execute_query(query, (database,))
+            
+            # For each procedure, get its complete CREATE PROCEDURE statement
+            for i, proc in enumerate(procedures):
+                # Get procedure parameter list
+                param_query = f"SHOW CREATE PROCEDURE `{database}`.`{proc['name']}`"
+                try:
+                    param_result = self.execute_query(param_query)
+                    if param_result and len(param_result) > 0:
+                        create_proc = param_result[0].get('Create Procedure', '')
+                        
+                        # Extract parameter list from CREATE PROCEDURE statement
+                        param_match = re.search(r'CREATE\s+PROCEDURE\s+`[^`]+`\s*\((.*?)\)', create_proc, re.DOTALL | re.IGNORECASE)
+                        if param_match:
+                            procedures[i]['param_list'] = param_match.group(1).strip()
+                        else:
+                            procedures[i]['param_list'] = ''
+                            
+                        # Extract procedure body
+                        body_match = re.search(r'CREATE\s+PROCEDURE\s+`[^`]+`\s*\(.*?\)(.*?)(?:COMMENT|$)', create_proc, re.DOTALL | re.IGNORECASE)
+                        if body_match:
+                            procedures[i]['body'] = body_match.group(1).strip()
+                        else:
+                            procedures[i]['body'] = proc['definition']
+                except Exception as inner_e:
+                    logger.error(f"Error getting procedure details for {proc['name']}: {str(inner_e)}")
+                    procedures[i]['param_list'] = ''
+                    procedures[i]['body'] = proc['definition']
+            
+            return procedures
+            
+        except Exception as e:
+            logger.error(f"Error getting stored procedures: {str(e)}")
+            return []
+
+    def get_views(self) -> List[Dict[str, Any]]:
+        """Get all views in the current database.
+        
+        Returns:
+            List of view definitions as dictionaries
+        """
+        self._ensure_connected()
+        database = self.get_current_database()
+        
+        try:
+            query = """
+            SELECT
+                TABLE_NAME AS name,
+                VIEW_DEFINITION AS definition,
+                CHECK_OPTION AS check_option,
+                IS_UPDATABLE AS is_updatable
+            FROM
+                information_schema.VIEWS
+            WHERE
+                TABLE_SCHEMA = %s
+            ORDER BY
+                TABLE_NAME
+            """
+            
+            result = self.execute_query(query, (database,))
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error getting views: {str(e)}")
+            return []
+
+    def get_events(self) -> List[Dict[str, Any]]:
+        """Get all events in the current database.
+        
+        Returns:
+            List of event definitions as dictionaries
+        """
+        self._ensure_connected()
+        database = self.get_current_database()
+        
+        try:
+            query = """
+            SELECT
+                EVENT_NAME AS name,
+                EVENT_DEFINITION AS body,
+                EVENT_SCHEDULE AS schedule_raw,
+                INTERVAL_VALUE AS interval_value,
+                INTERVAL_FIELD AS interval_field,
+                STARTS AS starts,
+                ENDS AS ends,
+                STATUS AS raw_status,
+                ON_COMPLETION AS on_completion,
+                CREATED AS created,
+                LAST_ALTERED AS last_altered,
+                LAST_EXECUTED AS last_executed,
+                EVENT_COMMENT AS comment
+            FROM
+                information_schema.EVENTS
+            WHERE
+                EVENT_SCHEMA = %s
+            ORDER BY
+                EVENT_NAME
+            """
+            
+            events = self.execute_query(query, (database,))
+            
+            # Format the schedule and status for each event
+            for i, event in enumerate(events):
+                # Format schedule
+                schedule = ""
+                if event.get('schedule_raw') == 'AT':
+                    # One-time event
+                    if event.get('starts'):
+                        schedule = f"AT '{event['starts']}'"
+                else:
+                    # Recurring event
+                    if event.get('interval_value') and event.get('interval_field'):
+                        schedule = f"EVERY {event['interval_value']} {event['interval_field']}"
+                        
+                        # Add start time if specified
+                        if event.get('starts'):
+                            schedule += f" STARTS '{event['starts']}'"
+                            
+                        # Add end time if specified
+                        if event.get('ends'):
+                            schedule += f" ENDS '{event['ends']}'"
+                
+                events[i]['schedule'] = schedule
+                
+                # Format status
+                status = event.get('raw_status', '').upper()
+                if status == 'ENABLED':
+                    events[i]['status'] = 'ENABLE'
+                elif status == 'DISABLED':
+                    events[i]['status'] = 'DISABLE'
+                elif status == 'SLAVESIDE_DISABLED':
+                    events[i]['status'] = 'DISABLE ON SLAVE'
+                else:
+                    events[i]['status'] = ''
+            
+            return events
+            
+        except Exception as e:
+            logger.error(f"Error getting events: {str(e)}")
+            return []
+
+    def get_functions(self) -> List[Dict[str, Any]]:
+        """Get all functions in the current database.
+        
+        Returns:
+            List of function definitions as dictionaries
+        """
+        self._ensure_connected()
+        database = self.get_current_database()
+        
+        try:
+            # First get function names and basic info
+            query = """
+            SELECT
+                ROUTINE_NAME AS name,
+                ROUTINE_DEFINITION AS definition,
+                DTD_IDENTIFIER AS returns,
+                ROUTINE_COMMENT AS comment,
+                CHARACTER_SET_CLIENT AS charset,
+                COLLATION_CONNECTION AS collation,
+                SQL_DATA_ACCESS AS data_access
+            FROM
+                information_schema.ROUTINES
+            WHERE
+                ROUTINE_SCHEMA = %s AND
+                ROUTINE_TYPE = 'FUNCTION'
+            ORDER BY
+                ROUTINE_NAME
+            """
+            
+            functions = self.execute_query(query, (database,))
+            
+            # For each function, get its complete CREATE FUNCTION statement
+            for i, func in enumerate(functions):
+                # Build the function's characteristic string
+                characteristics = []
+                
+                if func.get('data_access'):
+                    characteristics.append(func['data_access'])
+                    
+                # Get function details from SHOW CREATE FUNCTION
+                try:
+                    show_query = f"SHOW CREATE FUNCTION `{database}`.`{func['name']}`"
+                    show_result = self.execute_query(show_query)
+                    
+                    if show_result and len(show_result) > 0:
+                        create_func = show_result[0].get('Create Function', '')
+                        
+                        # Extract parameter list
+                        param_match = re.search(r'CREATE\s+FUNCTION\s+`[^`]+`\s*\((.*?)\)', create_func, re.DOTALL | re.IGNORECASE)
+                        if param_match:
+                            functions[i]['param_list'] = param_match.group(1).strip()
+                        else:
+                            functions[i]['param_list'] = ''
+                            
+                        # Extract function body
+                        body_match = re.search(r'RETURNS\s+[^\s]+\s+(.*?)(?:COMMENT|$)', create_func, re.DOTALL | re.IGNORECASE)
+                        if body_match:
+                            functions[i]['body'] = body_match.group(1).strip()
+                        else:
+                            functions[i]['body'] = func['definition']
+                            
+                        # Extract deterministic characteristic if present
+                        if 'DETERMINISTIC' in create_func:
+                            characteristics.append('DETERMINISTIC')
+                        elif 'NOT DETERMINISTIC' in create_func:
+                            characteristics.append('NOT DETERMINISTIC')
+                except Exception as inner_e:
+                    logger.error(f"Error getting function details for {func['name']}: {str(inner_e)}")
+                    functions[i]['param_list'] = ''
+                    functions[i]['body'] = func['definition']
+                
+                # Combine all characteristics
+                if characteristics:
+                    functions[i]['characteristic'] = ' '.join(characteristics)
+                else:
+                    functions[i]['characteristic'] = ''
+            
+            return functions
+            
+        except Exception as e:
+            logger.error(f"Error getting functions: {str(e)}")
+            return []
+
+    def get_user_defined_types(self) -> List[Dict[str, Any]]:
+        """Get all user-defined types in the current database.
+        
+        Returns:
+            List of user-defined type definitions as dictionaries
+        """
+        self._ensure_connected()
+        database = self.get_current_database()
+        
+        try:
+            # This query works for MariaDB 10.5+ which supports user-defined types
+            query = """
+            SELECT 
+                mdt.TYPE_NAME AS name,
+                CONCAT(
+                    mdt.DATA_TYPE,
+                    CASE 
+                        WHEN mdt.DATA_TYPE IN ('varchar', 'char', 'varbinary', 'binary', 'text', 'blob') 
+                        THEN CONCAT('(', mdt.CHARACTER_MAXIMUM_LENGTH, ')')
+                        WHEN mdt.DATA_TYPE IN ('decimal', 'numeric')
+                        THEN CONCAT('(', mdt.NUMERIC_PRECISION, ',', mdt.NUMERIC_SCALE, ')')
+                        ELSE ''
+                    END
+                ) AS definition,
+                mdt.TYPE_COMMENT AS comment
+            FROM 
+                information_schema.USER_DEFINED_TYPES mdt
+            WHERE 
+                mdt.TYPE_SCHEMA = %s
+            ORDER BY 
+                mdt.TYPE_NAME
+            """
+            
+            # Try to execute the query - it will fail on older MariaDB versions that don't support user-defined types
+            try:
+                result = self.execute_query(query, (database,))
+                return result
+            except Exception as type_e:
+                # Check if the error is related to table not existing
+                if "Table 'information_schema.USER_DEFINED_TYPES' doesn't exist" in str(type_e):
+                    logger.info("User-defined types not supported in this MariaDB version")
+                    return []
+                else:
+                    # Re-raise other errors
+                    raise
+            
+        except Exception as e:
+            logger.error(f"Error getting user-defined types: {str(e)}")
+            return [] 

@@ -56,12 +56,21 @@ class ExportConfig:
     exclude_tables: list[str]
     exclude_data: list[str]
     include_information_schema: bool
+    exclude_triggers: bool
+    exclude_procedures: bool
+    exclude_views: bool
+    exclude_events: bool
+    exclude_functions: bool
+    exclude_user_types: bool
 
     def __init__(self, output_dir: str = 'exports', batch_size: int = 1000, compression: bool = False,
                  parallel_workers: int = 1, tables: list[str] = None, where: str = '',
                  exclude_schema: bool = False, exclude_indexes: bool = False,
                  exclude_constraints: bool = False, exclude_tables: list[str] = None,
-                 exclude_data: list[str] = None, include_information_schema: bool = False):
+                 exclude_data: list[str] = None, include_information_schema: bool = False,
+                 exclude_triggers: bool = False, exclude_procedures: bool = False,
+                 exclude_views: bool = False, exclude_events: bool = False,
+                 exclude_functions: bool = False, exclude_user_types: bool = False):
         self.output_dir = output_dir
         self.batch_size = batch_size
         self.compression = compression
@@ -74,13 +83,19 @@ class ExportConfig:
         self.exclude_tables = exclude_tables or []
         self.exclude_data = exclude_data or []
         self.include_information_schema = include_information_schema
+        self.exclude_triggers = exclude_triggers
+        self.exclude_procedures = exclude_procedures
+        self.exclude_views = exclude_views
+        self.exclude_events = exclude_events
+        self.exclude_functions = exclude_functions
+        self.exclude_user_types = exclude_user_types
     # SUGGESTION: Add option for partition handling (export/import all or specific partitions)
     # SUGGESTION: Add option for data transformation during export (filtering, anonymization)
 
 @dataclass
 class ImportConfig:
     """Import operation configuration."""
-    input_dir: str
+    input_dir: Union[str, List[str]]
     batch_size: int
     compression: bool
     parallel_workers: int
@@ -92,14 +107,23 @@ class ImportConfig:
     continue_on_error: bool
     import_schema: bool
     import_data: bool
+    import_triggers: bool
+    import_procedures: bool
+    import_views: bool
+    import_events: bool
+    import_functions: bool
+    import_user_types: bool
     database: str = ""  # Target database for import
 
-    def __init__(self, input_dir: str = 'exports', batch_size: int = 1000, compression: bool = False,
+    def __init__(self, input_dir: Union[str, List[str]] = 'exports', batch_size: int = 1000, compression: bool = False,
                  parallel_workers: int = 1, mode: str = 'cancel',
                  exclude_schema: bool = False, exclude_indexes: bool = False,
                  exclude_constraints: bool = False, disable_foreign_keys: bool = True,
                  continue_on_error: bool = False, import_schema: bool = True,
-                 import_data: bool = True, database: str = ""):
+                 import_data: bool = True, database: str = "",
+                 import_triggers: bool = True, import_procedures: bool = True,
+                 import_views: bool = True, import_events: bool = True,
+                 import_functions: bool = True, import_user_types: bool = True):
         self.input_dir = input_dir
         self.batch_size = batch_size
         self.compression = compression
@@ -113,6 +137,12 @@ class ImportConfig:
         self.import_schema = import_schema
         self.import_data = import_data
         self.database = database
+        self.import_triggers = import_triggers
+        self.import_procedures = import_procedures
+        self.import_views = import_views
+        self.import_events = import_events
+        self.import_functions = import_functions
+        self.import_user_types = import_user_types
     # SUGGESTION: Add option for data validation before import
     # SUGGESTION: Add option for data transformation during import (mapping values)
 
@@ -212,7 +242,13 @@ def load_config(config_file: Optional[Path] = None) -> Config:
         exclude_constraints=export_config.get('exclude_constraints', False),
         exclude_tables=export_config.get('exclude_tables', []),
         exclude_data=export_config.get('exclude_data', []),
-        include_information_schema=export_config.get('include_information_schema', False)
+        include_information_schema=export_config.get('include_information_schema', False),
+        exclude_triggers=export_config.get('exclude_triggers', False),
+        exclude_procedures=export_config.get('exclude_procedures', False),
+        exclude_views=export_config.get('exclude_views', False),
+        exclude_events=export_config.get('exclude_events', False),
+        exclude_functions=export_config.get('exclude_functions', False),
+        exclude_user_types=export_config.get('exclude_user_types', False)
     )
     
     # Load import config
@@ -230,7 +266,13 @@ def load_config(config_file: Optional[Path] = None) -> Config:
         continue_on_error=import_config.get('continue_on_error', False),
         import_schema=import_config.get('import_schema', True),
         import_data=import_config.get('import_data', True),
-        database=import_config.get('database', '')
+        database=import_config.get('database', ''),
+        import_triggers=import_config.get('import_triggers', True),
+        import_procedures=import_config.get('import_procedures', True),
+        import_views=import_config.get('import_views', True),
+        import_events=import_config.get('import_events', True),
+        import_functions=import_config.get('import_functions', True),
+        import_user_types=import_config.get('import_user_types', True)
     )
     
     # Load logging config

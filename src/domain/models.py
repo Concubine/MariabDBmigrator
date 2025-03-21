@@ -1,8 +1,8 @@
 """Domain models for the MariaDB export tool."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union, Set
 
 @dataclass
 class DatabaseConfig:
@@ -95,9 +95,18 @@ class ImportResult:
     """Result of an import operation."""
     table_name: str
     status: str
-    success: bool = True
+    file_name: str = ""
+    source_path: str = ""
+    error_message: str = ""
     rows_imported: int = 0
-    total_rows: int = 0  # For backward compatibility
-    file_path: Optional[str] = None
+    expected_rows: int = 0
     duration: float = 0.0
-    error_message: Optional[str] = None 
+    warnings: List[str] = field(default_factory=list)
+    success: bool = True  # Overall success flag
+    total_rows: int = 0  # Total rows processed (for backward compatibility)
+    validation_details: Optional[Dict[str, Any]] = None  # Additional validation details
+    
+    def __post_init__(self):
+        """Set success flag based on status if not explicitly set."""
+        if self.status == "error":
+            self.success = False 

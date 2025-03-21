@@ -6,6 +6,7 @@ import signal
 from pathlib import Path
 from typing import Optional
 import logging
+import os
 
 from src.core.config import load_config
 from src.core.logging import setup_logging, log_config
@@ -165,14 +166,22 @@ def main() -> int:
         # Parse arguments
         args = parse_args()
         
-        # Setup logging
-        verbose = getattr(args, 'verbose', False)
-        log_level = logging.DEBUG if verbose else logging.INFO
-        setup_logging(log_level)
-        
-        # Load configuration
+        # Load configuration first so we can access logging settings
         config_path = args.config
         config = load_config(config_path)
+        
+        # Setup logging using config file settings first, then consider command line override
+        verbose = getattr(args, 'verbose', False)
+        
+        # First, set up logging using the config file settings
+        setup_logging(config.logging)
+        
+        # If verbose flag is provided, override with DEBUG level
+        if verbose:
+            # Re-initialize with DEBUG level while keeping other settings
+            config.logging.level = 'DEBUG'
+            logging.info("Verbose flag detected, switching to DEBUG log level")
+            setup_logging(config.logging)
         
         # Log configuration for debugging
         log_config(config)
@@ -263,16 +272,50 @@ def main() -> int:
             if args.import_data:
                 config.import_.import_data = True
             
+            # If no specific files were provided, scan the input directory
+            if not import_files:
+                input_dirs = config.import_.input_dir
+                
+                # Convert input_dir to list if it's a string
+                if isinstance(input_dirs, str):
+                    input_dirs = [input_dirs]
+                
+                # Process each input directory
+                for input_dir in input_dirs:
+                    logging.info(f"Scanning input directory: {input_dir}")
+                    
+                    if os.path.exists(input_dir) and os.path.isdir(input_dir):
+                        # Recursively scan for SQL files
+                        for root, _, files in os.walk(input_dir):
+                            for file in files:
+                                if file.endswith('.sql'):
+                                    file_path = os.path.join(root, file)
+                                    import_files.append(file_path)
+                        
+                        logging.info(f"Found {len(import_files)} SQL files in {input_dir} and its subdirectories")
+                    else:
+                        logging.warning(f"Input directory {input_dir} does not exist or is not a directory")
+                
+                if not import_files:
+                    logging.warning("No SQL files found in the specified input directories")
+                    return 1
+            
             # Import data
             global import_service
             
-            # Create import service with ASCII interface
+            # Create export service with ASCII interface
             ui_interface = create_interface()
-            import_service = ImportService(config.database, import_files, config.import_, ui_interface)
+            
+            # Create MariaDB instance from config
+            from src.infrastructure.mariadb import MariaDB
+            mariadb = MariaDB(config.database)
+            
+            # Create import service with MariaDB instance
+            import_service = ImportService(mariadb, ui_interface)
             
             # Import data
             logging.info("Starting import process")
-            results = import_service.import_data()
+            results = import_service.import_data(import_files, str(config.import_.mode).split('.')[-1].lower())
             logging.info(f"Import process completed with {len(results)} files")
             
             # Return exit code

@@ -5,7 +5,7 @@ database:
   user: root
   password: "1qaz2wsx"
   database: ""
-  use_pure: false #Uses the pure Python implementation (MySQLConnection)
+  use_pure: true #Uses the pure Python implementation (MySQLConnection)
   auth_plugin: mysql_native_password  # MySQL authentication plugin to use
   ssl: false  # Whether to use SSL for the database connection
   ssl_ca: null  # Path to CA certificate file
@@ -37,7 +37,7 @@ import:
   exclude_schema: false
   exclude_indexes: false
   exclude_constraints: false
-  disable_foreign_keys: false
+  disable_foreign_keys: true
   continue_on_error: false
 
 # Logging configuration

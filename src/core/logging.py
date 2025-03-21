@@ -38,7 +38,21 @@ def setup_logging(config) -> None:
         
     else:
         # Assume it's a LoggingConfig object
-        log_level = config.level
+        # Convert string log level to numeric value
+        if isinstance(config.level, str):
+            log_level_str = config.level.upper()
+            # Map string log level to numeric value
+            level_map = {
+                'DEBUG': logging.DEBUG,
+                'INFO': logging.INFO,
+                'WARNING': logging.WARNING,
+                'ERROR': logging.ERROR,
+                'CRITICAL': logging.CRITICAL
+            }
+            log_level = level_map.get(log_level_str, logging.INFO)
+        else:
+            log_level = config.level
+            
         log_format = config.format
         log_file = config.file
         
