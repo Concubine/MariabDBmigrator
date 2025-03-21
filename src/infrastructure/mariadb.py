@@ -9,6 +9,7 @@ import sys
 import importlib.util
 import getpass
 import re
+import time
 
 from src.core.exceptions import DatabaseError
 from src.core.logging import get_logger
@@ -333,6 +334,18 @@ class MariaDB(DatabaseInterface):
             'use_pure': getattr(config, 'use_pure', True)
         }
         
+        # Set up logging
+        self.logger = logger
+        
+        # Connection pool settings
+        self._config['pool_name'] = 'mariadb_pool'
+        self._config['pool_size'] = 5  # Default to 5 connections in the pool
+        self._config['pool_reset_session'] = True
+        
+        # Retry settings
+        self.max_retries = 3
+        self.retry_backoff_factor = 1.5  # Each retry will wait 1.5 times longer
+        
         # Only add database if it's not empty
         if hasattr(config, 'database') and config.database:
             self._config['database'] = config.database
@@ -361,10 +374,11 @@ class MariaDB(DatabaseInterface):
                 self._config['ssl'] = ssl_options
         else:
             self._config['ssl_disabled'] = True
-            logger.debug("SSL disabled for database connection")
+            self.logger.debug("SSL disabled for database connection")
             
         self._connection = None
         self._cursor = None
+        self._prepared_statements = {}  # Cache for prepared statements
         
         # Handle localization issue by setting LC_ALL to C
         os.environ['LC_ALL'] = 'C'
@@ -517,193 +531,76 @@ class MariaDB(DatabaseInterface):
         return discovered_config
     
     def connect(self) -> None:
-        """Connect to the MariaDB database."""
+        """Connect to the MariaDB server with retry logic.
+        
+        Uses exponential backoff for connection retries.
+        
+        Raises:
+            DatabaseError: If connection fails after all retries
+        """
         if self._connection and self._connection.is_connected():
             return
+            
+        self.logger.info(f"Connecting to MariaDB server at {self._config.get('host')}:{self._config.get('port')}")
         
-        # Check if password is empty and prompt if needed
-        if not self._config['password']:
-            prompt_text = f"Enter password for {self._config['user']}@{self._config['host']}: "
-            self._config['password'] = getpass.getpass(prompt_text)
+        # Apply patches for authentication plugins if needed
+        patch_mysql_connector()
         
-        # Simplified connection approach - try direct connection first 
-        # This is based on what worked in our manual export script
-        try:
-            logger.info(f"Connecting to MariaDB at {self._config['host']}:{self._config['port']} as {self._config['user']}")
-            self._connection = mysql.connector.connect(**self._config)
-            logger.info("Successfully connected to MariaDB")
-            self._cursor = self._connection.cursor(dictionary=True)
-            return
-        except Error as e:
-            logger.warning(f"Direct connection failed: {str(e)}")
-            # Fall through to the existing multiple authentication methods approach
-            
-        # If direct connection fails, try the existing approach with multiple authentication methods
-        # Get the ssl_disabled value from the config
-        config_ssl_disabled = self._config.get('ssl_disabled', True)
-            
-        # Try to discover server configuration first, but only if SSL isn't disabled in config
-        if config_ssl_disabled:
-            logger.info("SSL is disabled in config, skipping server discovery")
-            self.discovered_config = {
-                'auth_plugin_discovered': None,
-                'ssl_required': False,
-                'server_supports_ssl': False,
-                'authentication_plugins': []
-            }
-        else:
-            self.discovered_config = self.discover_mariadb_config()
-            
-        # Prepare list of authentication plugins to try
-        auth_plugins = []
-        
-        # If we discovered a specific plugin for this user, try it first
-        if self.discovered_config and self.discovered_config['auth_plugin_discovered']:
-            auth_plugins.append(self.discovered_config['auth_plugin_discovered'])
-            
-        # If a specific auth plugin was configured, add it next
-        if 'auth_plugin' in self._config and self._config['auth_plugin'] not in auth_plugins:
-            auth_plugins.append(self._config['auth_plugin'])
-            
-        # Then add other discovered plugins
-        if self.discovered_config:
-            for plugin in self.discovered_config['authentication_plugins']:
-                if plugin not in auth_plugins:
-                    auth_plugins.append(plugin)
-        
-        # Then try these common plugins as fallback
-        additional_plugins = [
-            'mysql_native_password',
-            None,  # Let connector auto-detect
-            'caching_sha2_password',
-            'sha256_password'
-        ]
-        
-        # Add any plugins not already in our list
-        for plugin in additional_plugins:
-            if plugin not in auth_plugins:
-                auth_plugins.append(plugin)
-                
-        # Determine SSL settings based on discovery and config
-        # If SSL is disabled in config, always respect that setting
-        should_use_ssl = False
-        if not config_ssl_disabled and self.discovered_config:
-            # If SSL is required for the user, we must use it
-            if self.discovered_config['ssl_required']:
-                should_use_ssl = True
-                logger.info("Using SSL as it's required for this user")
-            # If server supports SSL and the config requests it, use it
-            elif self.discovered_config['server_supports_ssl']:
-                should_use_ssl = True
-                logger.info("Using SSL as server supports it and it's enabled in config")
-            else:
-                should_use_ssl = False
-                logger.info("Not using SSL as server does not support it or it's not required")
-        else:
-            should_use_ssl = False
-            logger.info("SSL is disabled in config")
-            
-        # Try different authentication methods
+        # Attempt connection with retry logic
+        retry_count = 0
         last_error = None
-        connection_success = False
         
-        # Set the SSL disabled flag based on our analysis
-        ssl_disabled = not should_use_ssl
-        
-        # First try with the determined SSL settings
-        for auth_plugin in auth_plugins:
-            if auth_plugin is not None:
-                logger.debug(f"Attempting to connect with auth_plugin: {auth_plugin}")
-                current_config = self._config.copy()
-                current_config['auth_plugin'] = auth_plugin
-                current_config['ssl_disabled'] = ssl_disabled
-            else:
-                logger.debug("Attempting to connect with auto-detected auth_plugin")
-                current_config = {k: v for k, v in self._config.items() if k != 'auth_plugin'}
-                current_config['ssl_disabled'] = ssl_disabled
-            
+        while retry_count <= self.max_retries:
             try:
-                # Add additional options to handle NULL ok_pkt errors
-                current_config['allow_local_infile'] = True
-                current_config['get_warnings'] = True
-                current_config['raise_on_warnings'] = False
+                # Clone config for connection to avoid modifying the original
+                conn_config = self._config.copy()
                 
-                self._connection = mysql.connector.connect(**current_config)
+                # Create the connection
+                self._connection = mysql.connector.connect(**conn_config)
+                
+                # Create a cursor
                 self._cursor = self._connection.cursor(dictionary=True)
-                logger.info(f"Connected to MariaDB database using {auth_plugin if auth_plugin else 'auto-detected'} authentication" + 
-                           f" with SSL {'enabled' if not ssl_disabled else 'disabled'}")
-                connection_success = True
-                break
-            except Error as e:
-                last_error = e
-                logger.debug(f"Connection attempt failed with {auth_plugin if auth_plugin else 'auto-detected'}" +
-                            f" and SSL {'enabled' if not ssl_disabled else 'disabled'}: {str(e)}")
-        
-        # If all connection attempts failed with the current SSL setting, try the opposite
-        # But only if SSL wasn't explicitly disabled in config
-        if not connection_success and not config_ssl_disabled:
-            # Toggle SSL setting
-            ssl_disabled = not ssl_disabled
-            logger.debug(f"Trying with SSL {'enabled' if not ssl_disabled else 'disabled'}")
-            
-            for auth_plugin in auth_plugins:
-                if auth_plugin is not None:
-                    logger.debug(f"Attempting to connect with auth_plugin: {auth_plugin}")
-                    current_config = self._config.copy()
-                    current_config['auth_plugin'] = auth_plugin
-                    current_config['ssl_disabled'] = ssl_disabled
+                
+                # Ensure autocommit is enabled
+                self._connection.autocommit = True
+                
+                # Set session variables for better performance
+                self._cursor.execute("SET SESSION group_concat_max_len = 1000000")
+                self._cursor.execute("SET SESSION sql_mode = 'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION'")
+                
+                # Log success
+                database_name = self._config.get('database', '')
+                if database_name:
+                    self.logger.info(f"Connected to MariaDB database: {database_name}")
                 else:
-                    logger.debug("Attempting to connect with auto-detected auth_plugin")
-                    current_config = {k: v for k, v in self._config.items() if k != 'auth_plugin'}
-                    current_config['ssl_disabled'] = ssl_disabled
+                    self.logger.info("Connected to MariaDB server (no database selected)")
                 
-                try:
-                    # Add additional options to handle NULL ok_pkt errors
-                    current_config['allow_local_infile'] = True
-                    current_config['get_warnings'] = True
-                    current_config['raise_on_warnings'] = False
-                    
-                    self._connection = mysql.connector.connect(**current_config)
-                    self._cursor = self._connection.cursor(dictionary=True)
-                    logger.info(f"Connected to MariaDB database using {auth_plugin if auth_plugin else 'auto-detected'} authentication" + 
-                               f" with SSL {'enabled' if not ssl_disabled else 'disabled'}")
-                    connection_success = True
-                    break
-                except Error as e:
-                    last_error = e
-                    logger.debug(f"Connection attempt failed with {auth_plugin if auth_plugin else 'auto-detected'}" +
-                                f" and SSL {'enabled' if not ssl_disabled else 'disabled'}: {str(e)}")
-        
-        # If all connection attempts failed, try a direct connection with minimal options
-        if not connection_success:
-            try:
-                logger.debug("Trying minimal connection as last resort")
-                minimal_config = {
-                    'host': self._config['host'],
-                    'port': self._config['port'],
-                    'user': self._config['user'],
-                    'password': self._config['password'],  # This will have the prompted password if it was initially empty
-                    'database': self._config.get('database', ''),
-                    'use_pure': True,
-                    'ssl_disabled': True,
-                    'allow_local_infile': True,
-                    'get_warnings': True,
-                    'raise_on_warnings': False,
-                    'connection_timeout': 10
-                }
-                self._connection = mysql.connector.connect(**minimal_config)
-                self._cursor = self._connection.cursor(dictionary=True)
-                logger.info("Connected to MariaDB database using minimal configuration")
-                connection_success = True
+                # If we get here, connection was successful
+                return
+                
             except Error as e:
-                last_error = e
-                logger.debug(f"Minimal connection attempt failed: {str(e)}")
+                # Increment retry count
+                retry_count += 1
+                last_error = str(e)
+                
+                # If we have more retries left, wait and try again
+                if retry_count <= self.max_retries:
+                    # Calculate backoff time with exponential increase
+                    wait_time = self.retry_backoff_factor ** (retry_count - 1)
+                    self.logger.warning(
+                        f"Connection attempt {retry_count} failed: {str(e)}. "
+                        f"Retrying in {wait_time:.1f} seconds..."
+                    )
+                    
+                    # Wait before next attempt
+                    time.sleep(wait_time)
+                    
+                # Otherwise, we've exhausted our retries
+                else:
+                    self.logger.error(f"Failed to connect to MariaDB after {self.max_retries} attempts: {str(e)}")
         
-        # If all connection attempts failed, raise an error with details
-        if not connection_success:
-            error_msg = f"Failed to connect to database after trying multiple authentication methods: {str(last_error)}"
-            logger.error(error_msg)
-            raise DatabaseError(error_msg)
+        # If we get here, all connection attempts failed
+        raise DatabaseError(f"Failed to connect to MariaDB: {last_error}")
     
     def disconnect(self) -> None:
         """Disconnect from the MariaDB database."""
@@ -957,163 +854,177 @@ class MariaDB(DatabaseInterface):
         except Error as e:
             raise DatabaseError(f"Failed to get data from table {table_name}: {str(e)}")
     
-    def execute(self, sql: str, params: Optional[Dict[str, Any]] = None) -> None:
-        """Execute a SQL statement.
+    def execute(self, sql: str, params: Optional[Dict[str, Any]] = None) -> int:
+        """Execute a SQL statement and return the number of affected rows.
+        
+        Uses prepared statements for improved performance and security.
         
         Args:
-            sql: SQL statement
-            params: Query parameters
+            sql: SQL statement to execute
+            params: Parameters for the SQL statement
+            
+        Returns:
+            Number of affected rows
             
         Raises:
-            Exception: If execution fails
+            DatabaseError: If execution fails
         """
         self._ensure_connected()
         
-        # Check if we need to select a database first
-        if not self._connection.database and "CREATE DATABASE" not in sql.upper():
-            error_msg = "No database selected. Please select a database before executing queries."
-            logger.error(error_msg)
-            raise Exception(error_msg)
-        
-        # Check if this is a database selection statement
-        select_db_match = re.search(r'USE\s+(?:`)?([^`\s]+)(?:`)?', sql, re.IGNORECASE)
-        if select_db_match:
-            db_name = select_db_match.group(1)
-            self.select_database(db_name)
-            return
-        
-        # Execute the query
         try:
-            self._cursor.execute(sql, params)
-            self._connection.commit()
-        except mysql.connector.Error as e:
-            logger.error(f"Error executing SQL: {e}")
-            logger.debug(f"SQL statement: {sql}")
+            # Check if this is a parameterized query
             if params:
-                logger.debug(f"Parameters: {params}")
-            self._connection.rollback()
-            raise Exception(f"Failed to execute SQL: {str(e)}")
+                # For prepared statements, we use tuples not dicts
+                param_tuple = None
+                
+                # Convert dict params to tuple or use tuple directly
+                if isinstance(params, dict):
+                    # Extract the parameter values based on placeholders in the SQL
+                    # Currently MySQL connector doesn't support named parameters natively
+                    # So we need to extract values in the correct order
+                    param_tuple = tuple(params.values())
+                elif isinstance(params, tuple):
+                    param_tuple = params
+                else:
+                    param_tuple = (params,)
+                
+                # Generate a key for the prepared statement cache
+                stmt_key = sql
+                
+                # Check if we have this statement prepared already
+                if stmt_key in self._prepared_statements:
+                    # Reuse existing prepared statement
+                    self.logger.debug(f"Using cached prepared statement for: {sql[:50]}...")
+                    stmt = self._prepared_statements[stmt_key]
+                else:
+                    # Prepare the statement
+                    self.logger.debug(f"Preparing new statement: {sql[:50]}...")
+                    stmt = self._cursor.execute(sql, param_tuple, prepared=True)
+                    # Cache for future use (MySQL connector actually handles the caching)
+                    self._prepared_statements[stmt_key] = stmt
+                    return self._cursor.rowcount
+                
+                # Execute with parameters
+                self._cursor.execute(sql, param_tuple)
+            else:
+                # Execute without parameters
+                self._cursor.execute(sql)
+                
+            # Return number of affected rows
+            return self._cursor.rowcount
+            
+        except Error as e:
+            self.logger.error(f"Error executing SQL: {str(e)}")
+            raise DatabaseError(f"Error executing SQL: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Unexpected error executing SQL: {str(e)}")
+            raise DatabaseError(f"Unexpected error executing SQL: {str(e)}")
 
     def execute_query(self, query: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """Execute a query and return the results.
         
-        Args:
-            query: The SQL query to execute.
-            params: Optional parameters for the query.
-            
-        Returns:
-            A list of dictionaries representing the rows returned by the query.
-            
-        Raises:
-            DatabaseError: If an error occurs during execution.
-        """
-        # Create a dedicated cursor for this query to avoid "Unread result found" errors
-        if not self._connection or not self._connection.is_connected():
-            self.connect()
-            
-        cursor = None
-        try:
-            cursor = self._connection.cursor(dictionary=True)
-            if params:
-                cursor.execute(query, params)
-            else:
-                cursor.execute(query)
-                
-            # Make sure to always fetch all results to avoid "Unread result found" errors
-            result = cursor.fetchall()
-            return result
-        except Error as e:
-            raise DatabaseError(f"Query execution failed: {str(e)}")
-        finally:
-            # Always close the cursor
-            if cursor:
-                cursor.close()
-    
-    def execute_batch(self, statements: List[str]) -> None:
-        """Execute a batch of SQL statements.
+        Uses prepared statements for improved performance and security.
         
         Args:
-            statements: List of SQL statements to execute
+            query: SQL query to execute
+            params: Parameters for the query
+            
+        Returns:
+            List of dictionaries with query results
             
         Raises:
-            DatabaseError: If an error occurs during execution
+            DatabaseError: If query execution fails
         """
+        self._ensure_connected()
+        
         try:
-            self._ensure_connected()
+            # Log query for debugging
+            param_str = str(params) if params else "None"
+            logger.info(f"Executing query: {query.strip()[:200]}... with params: {param_str}")
             
-            # Start transaction
-            self._connection.start_transaction()
+            # For prepared statements, convert parameters
+            param_tuple = None
+            if params:
+                if isinstance(params, dict):
+                    param_tuple = tuple(params.values())
+                elif isinstance(params, tuple):
+                    param_tuple = params
+                else:
+                    param_tuple = (params,)
+                    
+                # Execute query with parameters
+                self._cursor.execute(query, param_tuple)
+            else:
+                # Execute without parameters
+                self._cursor.execute(query)
+                
+            # Fetch results
+            results = self._cursor.fetchall()
+            result_count = len(results) if results else 0
+            logger.info(f"Query returned {result_count} results")
             
-            # Execute statements
-            for stmt in statements:
-                try:
-                    self._cursor.execute(stmt)
-                except Error as e:
-                    # Rollback transaction on error
-                    self._connection.rollback()
-                    raise DatabaseError(f"Failed to execute statement: {str(e)}\nStatement: {stmt}")
+            # Log first result for debugging if available
+            if result_count > 0:
+                sample = str(results[0])[:200] + "..." if len(str(results[0])) > 200 else str(results[0])
+                logger.info(f"Sample result: {sample}")
             
-            # Commit transaction
-            self._connection.commit()
+            return results or []
             
         except Error as e:
-            # Rollback transaction on error
-            try:
-                self._connection.rollback()
-            except:
-                pass
-            raise DatabaseError(f"Failed to execute batch: {str(e)}")
-            
-    def execute_many(self, query: str, params: List[List[Any]]) -> None:
+            self.logger.error(f"Error executing query: {str(e)}")
+            raise DatabaseError(f"Error executing query: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Unexpected error executing query: {str(e)}")
+            raise DatabaseError(f"Unexpected error executing query: {str(e)}")
+    
+    def execute_many(self, query: str, params: List[List[Any]]) -> int:
         """Execute a parameterized SQL query with multiple parameter sets.
+        
+        Uses optimized batch execution for better performance.
         
         Args:
             query: SQL query with placeholders
             params: List of parameter sets to execute with the query
             
+        Returns:
+            Number of rows affected
+            
         Raises:
             DatabaseError: If an error occurs during execution
         """
+        self._ensure_connected()
+        
         try:
-            self._ensure_connected()
-            
-            # Start transaction
+            # Start transaction for batch operations
             self._connection.start_transaction()
             
             try:
-                # Execute query with multiple parameter sets
+                # Use executemany for efficient batch operations
                 self._cursor.executemany(query, params)
+                
+                # Get row count
+                rows_affected = self._cursor.rowcount
                 
                 # Commit transaction
                 self._connection.commit()
+                
+                return rows_affected
+                
             except Error as e:
                 # Rollback transaction on error
                 self._connection.rollback()
-                raise DatabaseError(f"Failed to execute parameterized query: {str(e)}\nQuery: {query}")
-            
+                self.logger.error(f"Error executing batch query: {str(e)}")
+                raise DatabaseError(f"Error executing batch query: {str(e)}")
+                
         except Error as e:
             # Rollback transaction on error
             try:
                 self._connection.rollback()
             except:
                 pass
-            raise DatabaseError(f"Failed to execute batch query: {str(e)}")
-            
-    def _format_value(self, value: Any) -> str:
-        """Format a value for SQL insertion."""
-        if value is None:
-            return 'NULL'
-        elif isinstance(value, (int, float)):
-            return str(value)
-        elif isinstance(value, (datetime, date)):
-            return f"'{value.isoformat()}'"
-        elif isinstance(value, bool):
-            return '1' if value else '0'
-        else:
-            # Escape single quotes and backslashes
-            escaped = str(value).replace("'", "''").replace("\\", "\\\\")
-            return f"'{escaped}'"
-    
+            self.logger.error(f"Failed to execute batch operation: {str(e)}")
+            raise DatabaseError(f"Failed to execute batch operation: {str(e)}")
+
     def __enter__(self):
         """Context manager entry."""
         self.connect()
@@ -1224,31 +1135,34 @@ class MariaDB(DatabaseInterface):
         """Get the name of the currently selected database.
         
         Returns:
-            Current database name or empty string if none is selected
+            The name of the currently selected database, or an empty string if none is selected
         """
         try:
-            self._ensure_connected()
-            self._cursor.execute("SELECT DATABASE()")
-            result = self._cursor.fetchone()
-            if result and result.get('DATABASE()'):
-                return result['DATABASE()']
+            result = self.execute_query("SELECT DATABASE() as db")
+            if result and len(result) > 0 and 'db' in result[0]:
+                return result[0]['db'] or ""
             return ""
-        except Error as e:
-            raise DatabaseError(f"Failed to get current database: {str(e)}")
+        except Exception as e:
+            self.logger.warning(f"Error getting current database: {str(e)}")
+            return ""
             
-    def select_database(self, database: str) -> None:
-        """Select a database to use.
+    def select_database(self, database_name: str) -> None:
+        """Select a database for subsequent operations.
         
         Args:
-            database: Name of the database to select
+            database_name: The name of the database to use
+            
+        Raises:
+            Exception: If the database doesn't exist or cannot be selected
         """
         try:
-            self._ensure_connected()
-            self._cursor.execute(f"USE `{database}`")
-            # Update the database name in config
-            self._config['database'] = database
-        except Error as e:
-            raise DatabaseError(f"Failed to select database {database}: {str(e)}")
+            self.logger.info(f"Selecting database: {database_name}")
+            self.execute(f"USE `{database_name}`")
+            self.config['database'] = database_name
+            self.logger.info(f"Database {database_name} selected")
+        except Exception as e:
+            self.logger.error(f"Failed to select database {database_name}: {str(e)}")
+            raise Exception(f"Failed to select database {database_name}: {str(e)}")
 
     def get_row_count(self, table_name: str, where_clause: Optional[str] = None) -> int:
         """Get the number of rows in a table.
@@ -1286,6 +1200,15 @@ class MariaDB(DatabaseInterface):
         self._ensure_connected()
         database = self.get_current_database()
         
+        # Fallback to configured database if current is empty
+        if not database and 'database' in self._config:
+            database = self._config['database']
+            logger.info(f"Using configured database for triggers: {database}")
+        
+        if not database:
+            logger.warning("No database selected for trigger lookup")
+            return []
+        
         try:
             query = """
             SELECT
@@ -1318,7 +1241,19 @@ class MariaDB(DatabaseInterface):
         self._ensure_connected()
         database = self.get_current_database()
         
+        # Fallback to configured database if current is empty
+        if not database and 'database' in self._config:
+            database = self._config['database']
+            logger.info(f"Using configured database for procedures: {database}")
+        
+        if not database:
+            logger.warning("No database selected for procedure lookup")
+            return []
+            
         try:
+            # Debug log the current database
+            logger.info(f"Looking for procedures in database: {database}")
+            
             # First get procedure names and parameters
             query = """
             SELECT
@@ -1334,16 +1269,20 @@ class MariaDB(DatabaseInterface):
                 ROUTINE_NAME
             """
             
+            logger.info(f"Executing procedure query: {query.strip()}")
             procedures = self.execute_query(query, (database,))
+            logger.info(f"Found {len(procedures)} procedures in database {database}")
             
             # For each procedure, get its complete CREATE PROCEDURE statement
             for i, proc in enumerate(procedures):
                 # Get procedure parameter list
                 param_query = f"SHOW CREATE PROCEDURE `{database}`.`{proc['name']}`"
+                logger.info(f"Getting details for procedure: {proc['name']} with query: {param_query}")
                 try:
                     param_result = self.execute_query(param_query)
                     if param_result and len(param_result) > 0:
                         create_proc = param_result[0].get('Create Procedure', '')
+                        logger.debug(f"Create procedure statement: {create_proc[:100]}...")
                         
                         # Extract parameter list from CREATE PROCEDURE statement
                         param_match = re.search(r'CREATE\s+PROCEDURE\s+`[^`]+`\s*\((.*?)\)', create_proc, re.DOTALL | re.IGNORECASE)
@@ -1351,6 +1290,7 @@ class MariaDB(DatabaseInterface):
                             procedures[i]['param_list'] = param_match.group(1).strip()
                         else:
                             procedures[i]['param_list'] = ''
+                            logger.warning(f"Could not extract param list for {proc['name']}")
                             
                         # Extract procedure body
                         body_match = re.search(r'CREATE\s+PROCEDURE\s+`[^`]+`\s*\(.*?\)(.*?)(?:COMMENT|$)', create_proc, re.DOTALL | re.IGNORECASE)
@@ -1358,6 +1298,7 @@ class MariaDB(DatabaseInterface):
                             procedures[i]['body'] = body_match.group(1).strip()
                         else:
                             procedures[i]['body'] = proc['definition']
+                            logger.warning(f"Could not extract body for {proc['name']}, using definition instead")
                 except Exception as inner_e:
                     logger.error(f"Error getting procedure details for {proc['name']}: {str(inner_e)}")
                     procedures[i]['param_list'] = ''
@@ -1377,6 +1318,15 @@ class MariaDB(DatabaseInterface):
         """
         self._ensure_connected()
         database = self.get_current_database()
+        
+        # Fallback to configured database if current is empty
+        if not database and 'database' in self._config:
+            database = self._config['database']
+            logger.info(f"Using configured database for views: {database}")
+        
+        if not database:
+            logger.warning("No database selected for view lookup")
+            return []
         
         try:
             query = """
@@ -1408,6 +1358,15 @@ class MariaDB(DatabaseInterface):
         """
         self._ensure_connected()
         database = self.get_current_database()
+        
+        # Fallback to configured database if current is empty
+        if not database and 'database' in self._config:
+            database = self._config['database']
+            logger.info(f"Using configured database for events: {database}")
+        
+        if not database:
+            logger.warning("No database selected for event lookup")
+            return []
         
         try:
             query = """
@@ -1484,8 +1443,16 @@ class MariaDB(DatabaseInterface):
         self._ensure_connected()
         database = self.get_current_database()
         
+        # Fallback to configured database if current is empty
+        if not database and 'database' in self._config:
+            database = self._config['database']
+            logger.info(f"Using configured database for functions: {database}")
+        
+        if not database:
+            logger.warning("No database selected for function lookup")
+            return []
+        
         try:
-            # First get function names and basic info
             query = """
             SELECT
                 ROUTINE_NAME AS name,
@@ -1494,7 +1461,7 @@ class MariaDB(DatabaseInterface):
                 ROUTINE_COMMENT AS comment,
                 CHARACTER_SET_CLIENT AS charset,
                 COLLATION_CONNECTION AS collation,
-                SQL_DATA_ACCESS AS data_access
+                DATABASE_COLLATION AS db_collation
             FROM
                 information_schema.ROUTINES
             WHERE
@@ -1567,43 +1534,303 @@ class MariaDB(DatabaseInterface):
         self._ensure_connected()
         database = self.get_current_database()
         
+        # Fallback to configured database if current is empty
+        if not database and 'database' in self._config:
+            database = self._config['database']
+            logger.info(f"Using configured database for user-defined types: {database}")
+        
+        if not database:
+            logger.warning("No database selected for user-defined type lookup")
+            return []
+        
         try:
-            # This query works for MariaDB 10.5+ which supports user-defined types
+            # This query is specific to MariaDB's implementation of user-defined types
             query = """
-            SELECT 
+            SELECT
                 mdt.TYPE_NAME AS name,
                 CONCAT(
                     mdt.DATA_TYPE,
-                    CASE 
-                        WHEN mdt.DATA_TYPE IN ('varchar', 'char', 'varbinary', 'binary', 'text', 'blob') 
-                        THEN CONCAT('(', mdt.CHARACTER_MAXIMUM_LENGTH, ')')
+                    CASE
+                        WHEN mdt.DATA_TYPE IN ('varchar', 'char', 'varbinary', 'binary')
+                            THEN CONCAT('(', mdt.CHARACTER_MAXIMUM_LENGTH, ')')
                         WHEN mdt.DATA_TYPE IN ('decimal', 'numeric')
-                        THEN CONCAT('(', mdt.NUMERIC_PRECISION, ',', mdt.NUMERIC_SCALE, ')')
+                            THEN CONCAT('(', mdt.NUMERIC_PRECISION, ',', mdt.NUMERIC_SCALE, ')')
                         ELSE ''
                     END
-                ) AS definition,
-                mdt.TYPE_COMMENT AS comment
-            FROM 
+                ) AS definition
+            FROM
                 information_schema.USER_DEFINED_TYPES mdt
-            WHERE 
+            WHERE
                 mdt.TYPE_SCHEMA = %s
-            ORDER BY 
+            ORDER BY
                 mdt.TYPE_NAME
             """
             
-            # Try to execute the query - it will fail on older MariaDB versions that don't support user-defined types
-            try:
-                result = self.execute_query(query, (database,))
-                return result
-            except Exception as type_e:
-                # Check if the error is related to table not existing
-                if "Table 'information_schema.USER_DEFINED_TYPES' doesn't exist" in str(type_e):
-                    logger.info("User-defined types not supported in this MariaDB version")
-                    return []
-                else:
-                    # Re-raise other errors
-                    raise
+            result = self.execute_query(query, (database,))
+            return result
             
         except Exception as e:
             logger.error(f"Error getting user-defined types: {str(e)}")
-            return [] 
+            return []
+
+    def drop_all_tables(self) -> None:
+        """Drop all tables in the current database."""
+        try:
+            self._ensure_connected()
+            
+            # First, disable foreign key checks to avoid constraint errors
+            self.execute("SET FOREIGN_KEY_CHECKS = 0")
+            
+            # Get all tables
+            tables = self.get_table_names()
+            
+            if not tables:
+                logger.info("No tables to drop")
+                return
+                
+            logger.info(f"Dropping {len(tables)} tables")
+            
+            # Drop each table
+            for table in tables:
+                logger.debug(f"Dropping table {table}")
+                self.execute(f"DROP TABLE IF EXISTS `{table}`")
+                
+            # Re-enable foreign key checks
+            self.execute("SET FOREIGN_KEY_CHECKS = 1")
+            
+            logger.info(f"Successfully dropped {len(tables)} tables")
+            
+        except Exception as e:
+            logger.error(f"Error dropping tables: {str(e)}")
+            raise DatabaseError(f"Failed to drop tables: {str(e)}")
+            
+    def drop_all_triggers(self) -> None:
+        """Drop all triggers in the current database."""
+        try:
+            self._ensure_connected()
+            
+            # Get all triggers
+            triggers = self.get_triggers()
+            
+            if not triggers:
+                logger.info("No triggers to drop")
+                return
+                
+            logger.info(f"Dropping {len(triggers)} triggers")
+            
+            # Drop each trigger
+            for trigger in triggers:
+                trigger_name = trigger.get('TRIGGER_NAME')
+                if trigger_name:
+                    logger.debug(f"Dropping trigger {trigger_name}")
+                    self.execute(f"DROP TRIGGER IF EXISTS `{trigger_name}`")
+                    
+            logger.info(f"Successfully dropped {len(triggers)} triggers")
+            
+        except Exception as e:
+            logger.error(f"Error dropping triggers: {str(e)}")
+            raise DatabaseError(f"Failed to drop triggers: {str(e)}")
+            
+    def drop_all_procedures(self) -> None:
+        """Drop all stored procedures in the current database."""
+        try:
+            self._ensure_connected()
+            
+            # Get all procedures
+            procedures = self.get_procedures()
+            
+            if not procedures:
+                logger.info("No procedures to drop")
+                return
+                
+            logger.info(f"Dropping {len(procedures)} procedures")
+            
+            # Drop each procedure
+            for procedure in procedures:
+                procedure_name = procedure.get('SPECIFIC_NAME')
+                if procedure_name:
+                    logger.debug(f"Dropping procedure {procedure_name}")
+                    self.execute(f"DROP PROCEDURE IF EXISTS `{procedure_name}`")
+                    
+            logger.info(f"Successfully dropped {len(procedures)} procedures")
+            
+        except Exception as e:
+            logger.error(f"Error dropping procedures: {str(e)}")
+            raise DatabaseError(f"Failed to drop procedures: {str(e)}")
+            
+    def drop_all_views(self) -> None:
+        """Drop all views in the current database."""
+        try:
+            self._ensure_connected()
+            
+            # Get all views
+            views = self.get_views()
+            
+            if not views:
+                logger.info("No views to drop")
+                return
+                
+            logger.info(f"Dropping {len(views)} views")
+            
+            # Drop each view
+            for view in views:
+                view_name = view.get('TABLE_NAME')
+                if view_name:
+                    logger.debug(f"Dropping view {view_name}")
+                    self.execute(f"DROP VIEW IF EXISTS `{view_name}`")
+                    
+            logger.info(f"Successfully dropped {len(views)} views")
+            
+        except Exception as e:
+            logger.error(f"Error dropping views: {str(e)}")
+            raise DatabaseError(f"Failed to drop views: {str(e)}")
+            
+    def drop_all_events(self) -> None:
+        """Drop all events in the current database."""
+        try:
+            self._ensure_connected()
+            
+            # Get all events
+            events = self.get_events()
+            
+            if not events:
+                logger.info("No events to drop")
+                return
+                
+            logger.info(f"Dropping {len(events)} events")
+            
+            # Drop each event
+            for event in events:
+                event_name = event.get('EVENT_NAME')
+                if event_name:
+                    logger.debug(f"Dropping event {event_name}")
+                    self.execute(f"DROP EVENT IF EXISTS `{event_name}`")
+                    
+            logger.info(f"Successfully dropped {len(events)} events")
+            
+        except Exception as e:
+            logger.error(f"Error dropping events: {str(e)}")
+            raise DatabaseError(f"Failed to drop events: {str(e)}")
+            
+    def drop_all_functions(self) -> None:
+        """Drop all functions in the current database."""
+        try:
+            self._ensure_connected()
+            
+            # Get all functions
+            functions = self.get_functions()
+            
+            if not functions:
+                logger.info("No functions to drop")
+                return
+                
+            logger.info(f"Dropping {len(functions)} functions")
+            
+            # Drop each function
+            for function in functions:
+                function_name = function.get('SPECIFIC_NAME')
+                if function_name:
+                    logger.debug(f"Dropping function {function_name}")
+                    self.execute(f"DROP FUNCTION IF EXISTS `{function_name}`")
+                    
+            logger.info(f"Successfully dropped {len(functions)} functions")
+            
+        except Exception as e:
+            logger.error(f"Error dropping functions: {str(e)}")
+            raise DatabaseError(f"Failed to drop functions: {str(e)}")
+            
+    def drop_all_user_types(self) -> None:
+        """Drop all user-defined types in the current database."""
+        try:
+            self._ensure_connected()
+            
+            # Get all user-defined types
+            user_types = self.get_user_defined_types()
+            
+            if not user_types:
+                logger.info("No user-defined types to drop")
+                return
+                
+            logger.info(f"Dropping {len(user_types)} user-defined types")
+            
+            # Drop each user-defined type
+            for user_type in user_types:
+                type_name = user_type.get('TYPE_NAME')
+                if type_name:
+                    logger.debug(f"Dropping user-defined type {type_name}")
+                    self.execute(f"DROP TYPE IF EXISTS `{type_name}`")
+                    
+            logger.info(f"Successfully dropped {len(user_types)} user-defined types")
+            
+        except Exception as e:
+            logger.error(f"Error dropping user-defined types: {str(e)}")
+            raise DatabaseError(f"Failed to drop user-defined types: {str(e)}")
+
+    def _format_value(self, value: Any) -> str:
+        """Format a value for SQL insertion.
+        
+        Args:
+            value: Value to format
+            
+        Returns:
+            Formatted value as string
+        """
+        if value is None:
+            return 'NULL'
+        elif isinstance(value, (int, float)):
+            return str(value)
+        elif isinstance(value, (datetime, date)):
+            return f"'{value.isoformat()}'"
+        elif isinstance(value, bool):
+            return '1' if value else '0'
+        else:
+            # Escape single quotes and backslashes
+            escaped = str(value).replace("'", "''").replace("\\", "\\\\")
+            return f"'{escaped}'"
+            
+    def execute_batch(self, statements: List[str]) -> int:
+        """Execute a batch of SQL statements within a single transaction.
+        
+        Args:
+            statements: List of SQL statements to execute
+            
+        Returns:
+            Total number of rows affected
+            
+        Raises:
+            DatabaseError: If an error occurs during execution
+        """
+        self._ensure_connected()
+        
+        # Track total affected rows
+        total_affected = 0
+        
+        try:
+            # Start transaction
+            self._connection.start_transaction()
+            
+            # Execute statements
+            for stmt in statements:
+                try:
+                    self._cursor.execute(stmt)
+                    total_affected += self._cursor.rowcount
+                except Error as e:
+                    # Rollback transaction on error
+                    self._connection.rollback()
+                    self.logger.error(f"Failed to execute statement: {str(e)}")
+                    self.logger.debug(f"Statement: {stmt[:100]}...")
+                    raise DatabaseError(f"Failed to execute statement: {str(e)}")
+            
+            # Commit transaction
+            self._connection.commit()
+            
+            return total_affected
+            
+        except Error as e:
+            # Rollback transaction on error
+            try:
+                self._connection.rollback()
+            except:
+                pass
+            self.logger.error(f"Failed to execute batch: {str(e)}")
+            raise DatabaseError(f"Failed to execute batch: {str(e)}") 

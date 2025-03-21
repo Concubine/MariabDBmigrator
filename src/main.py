@@ -131,6 +131,7 @@ def parse_args() -> argparse.Namespace:
     import_parser.add_argument("--continue-on-error", action="store_true", help="Continue on error")
     import_parser.add_argument("--import-schema", action="store_true", help="Import table schema")
     import_parser.add_argument("--import-data", action="store_true", help="Import table data")
+    import_parser.add_argument("--force-drop", action="store_true", help="Force drop existing database objects before importing")
     import_parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
     # SUGGESTION: Add --dry-run option to parse and validate SQL without executing
     # SUGGESTION: Add progress bar option with rich or tqdm libraries
@@ -271,6 +272,8 @@ def main() -> int:
                 config.import_.import_schema = True
             if args.import_data:
                 config.import_.import_data = True
+            if args.force_drop:
+                config.import_.force_drop = True
             
             # If no specific files were provided, scan the input directory
             if not import_files:
@@ -310,24 +313,38 @@ def main() -> int:
             from src.infrastructure.mariadb import MariaDB
             mariadb = MariaDB(config.database)
             
+            # Create storage service
+            from src.infrastructure.storage import SQLStorage
+            storage_service = SQLStorage()
+            
+            # Update import configuration from command line args
+            import_config = config.import_
+            
             # Create import service with MariaDB instance
-            import_service = ImportService(mariadb, ui_interface)
+            import_service = ImportService(
+                mariadb=mariadb,
+                storage_service=storage_service,
+                files=import_files,
+                config=import_config
+            )
             
-            # Import data
-            logging.info("Starting import process")
-            results = import_service.import_data(import_files, str(config.import_.mode).split('.')[-1].lower())
-            logging.info(f"Import process completed with {len(results)} files")
+            # Import the data
+            results = import_service.import_data()
             
-            # Return exit code
-            success_count = sum(1 for r in results if getattr(r, 'success', False))
+            # Count successes and failures
+            success_count = sum(1 for r in results if r.status == "success")
+            warning_count = sum(1 for r in results if r.status == "warning")
+            error_count = sum(1 for r in results if r.status == "error")
+            
+            # Log results
             if success_count == 0 and len(results) > 0:
                 logging.error("All imports failed")
                 return 1
-            elif success_count < len(results):
-                logging.warning(f"{len(results) - success_count} of {len(results)} imports failed")
+            elif error_count > 0:
+                logging.warning(f"{error_count} of {len(results)} imports failed")
                 return 0
             else:
-                logging.info("All imports successful")
+                logging.info(f"All imports completed: {success_count} successful, {warning_count} with warnings")
                 return 0
                 
     except ConfigError as e:

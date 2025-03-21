@@ -114,6 +114,7 @@ class ImportConfig:
     import_functions: bool
     import_user_types: bool
     database: str = ""  # Target database for import
+    force_drop: bool = False  # Whether to force drop existing database objects before importing
 
     def __init__(self, input_dir: Union[str, List[str]] = 'exports', batch_size: int = 1000, compression: bool = False,
                  parallel_workers: int = 1, mode: str = 'cancel',
@@ -123,7 +124,8 @@ class ImportConfig:
                  import_data: bool = True, database: str = "",
                  import_triggers: bool = True, import_procedures: bool = True,
                  import_views: bool = True, import_events: bool = True,
-                 import_functions: bool = True, import_user_types: bool = True):
+                 import_functions: bool = True, import_user_types: bool = True,
+                 force_drop: bool = False):
         self.input_dir = input_dir
         self.batch_size = batch_size
         self.compression = compression
@@ -143,6 +145,7 @@ class ImportConfig:
         self.import_events = import_events
         self.import_functions = import_functions
         self.import_user_types = import_user_types
+        self.force_drop = force_drop
     # SUGGESTION: Add option for data validation before import
     # SUGGESTION: Add option for data transformation during import (mapping values)
 
@@ -188,11 +191,11 @@ def get_default_config_path() -> Path:
     base_dir = getattr(sys, '_MEIPASS', Path(__file__).parent.parent.parent)
     return Path(base_dir) / "config" / "config.yaml"
 
-def load_config(config_file: Optional[Path] = None) -> Config:
-    """Load configuration from YAML file.
+def load_config(config_file: Optional[Union[Path, str]] = None) -> Config:
+    """Load configuration from a file.
     
     Args:
-        config_file: Path to configuration file. If not provided, uses default path.
+        config_file: Path to the configuration file
         
     Returns:
         Config object with loaded settings
@@ -203,6 +206,10 @@ def load_config(config_file: Optional[Path] = None) -> Config:
     # Try to find the configuration file
     if config_file is None:
         config_file = _find_config_file()
+    
+    # Convert string path to Path object if needed
+    if isinstance(config_file, str):
+        config_file = Path(config_file)
         
     if not config_file.exists():
         raise ConfigError(f"Configuration file not found: {config_file}")
@@ -272,7 +279,8 @@ def load_config(config_file: Optional[Path] = None) -> Config:
         import_views=import_config.get('import_views', True),
         import_events=import_config.get('import_events', True),
         import_functions=import_config.get('import_functions', True),
-        import_user_types=import_config.get('import_user_types', True)
+        import_user_types=import_config.get('import_user_types', True),
+        force_drop=import_config.get('force_drop', False)
     )
     
     # Load logging config

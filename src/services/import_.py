@@ -19,30 +19,111 @@ from src.ui.progress import ProgressTracker, ProgressStats
 
 logger = get_logger(__name__)
 
+class ImportResult:
+    """Result of an import operation."""
+    
+    def __init__(self, file_name=None, file_path=None, status="pending", 
+                 error=None, warning=None, statements_total=0, statements_executed=0,
+                 expected_rows=0, actual_rows=0, start_time=None, end_time=None,
+                 duration=0, checksum=None, file_type=None):
+        """Initialize import result.
+        
+        Args:
+            file_name: Name of the imported file
+            file_path: Path to the imported file
+            status: Status of the import (pending, success, warning, error)
+            error: Error message if import failed
+            warning: Warning message if import had issues
+            statements_total: Total number of SQL statements in the file
+            statements_executed: Number of successfully executed statements
+            expected_rows: Expected number of rows (for data imports)
+            actual_rows: Actual number of rows imported
+            start_time: Import start time
+            end_time: Import end time
+            duration: Import duration in seconds
+            checksum: File checksum for verification
+            file_type: Type of file (schema, data, triggers, etc.)
+        """
+        self.file_name = file_name
+        self.file_path = file_path
+        self.status = status
+        self.error = error
+        self.warning = warning
+        self.statements_total = statements_total
+        self.statements_executed = statements_executed
+        self.expected_rows = expected_rows
+        self.actual_rows = actual_rows
+        self.start_time = start_time
+        self.end_time = end_time
+        self.duration = duration
+        self.checksum = checksum
+        self.file_type = file_type
+        self.errors = []  # List to store multiple errors
+        
+    def __str__(self):
+        """Return string representation of import result."""
+        status_str = f"{self.status.upper()}"
+        if self.error:
+            status_str += f": {self.error}"
+        elif self.warning:
+            status_str += f": {self.warning}"
+            
+        if self.file_type and self.file_type != "unknown":
+            file_info = f"{self.file_name} ({self.file_type})"
+        else:
+            file_info = self.file_name
+            
+        if self.duration:
+            duration_str = f" in {self.duration:.2f}s"
+        else:
+            duration_str = ""
+            
+        statement_info = ""
+        if self.statements_total > 0:
+            statement_info = f", {self.statements_executed}/{self.statements_total} statements"
+            
+        row_info = ""
+        if self.expected_rows > 0:
+            row_info = f", {self.actual_rows}/{self.expected_rows} rows"
+            
+        return f"{file_info}: {status_str}{duration_str}{statement_info}{row_info}"
+
 class ImportService:
     """Service for importing data from SQL files."""
 
-    def __init__(self, mariadb, ui=None, logger=None):
-        """Initialize the import service.
+    def __init__(self, mariadb, storage_service, files: List[str] = None, config: ImportConfig = None):
+        """Initialize the ImportService.
         
         Args:
-            mariadb: MariaDB instance for database operations
-            ui: UI instance for displaying progress and results
-            logger: Logger instance
+            mariadb: MariaDB instance
+            storage_service: Storage service
+            files: List of files to import
+            config: Import configuration
         """
-        self.mariadb = mariadb
-        self.ui = ui
-        self.logger = logger or get_logger()
-        self.database = mariadb.database
-        self.files = []
-        self.config = ImportConfig()
+        if not config:
+            config = ImportConfig()
+        
+        self.files = files or []
+        self.config = config
         self.db = mariadb
-        self.storage = SQLStorage()
-        self.start_time = 0
-        self.files_processed = 0
-        self.total_statements = 0
-        self.statements_processed = 0
-        self.checksums = {}  # Store file checksums for validation
+        self.storage = storage_service
+        
+        # Fix: Get database from config instead of directly accessing the attribute
+        self.database = mariadb.config.get('database', '')
+        
+        self.logger = logging.getLogger('import')
+        
+        # Track checksums for imported files
+        self.checksums = {}
+        
+        # Configure logging
+        if hasattr(config, 'log_level') and config.log_level:
+            self.logger.setLevel(config.log_level)
+        
+        if hasattr(config, 'log_file') and config.log_file:
+            file_handler = logging.FileHandler(config.log_file)
+            file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+            self.logger.addHandler(file_handler)
         
         # Initialize table name mapping if provided
         self.table_mapping = {}
@@ -50,40 +131,271 @@ class ImportService:
             self.table_mapping = self.config.table_mapping
             logger.info(f"Using table name mapping for {len(self.table_mapping)} tables")
         
-    def import_data(self, file_paths, import_mode: str) -> None:
-        """Import data from a list of files.
-
-        Args:
-            file_paths: A list of file paths.
-            import_mode: Mode to use when importing data.
-        """
-        import_results = []
-        successful_imports = 0
-        warnings = 0
-        errors = 0
+    def import_data(self) -> dict:
+        """Import data from the specified files."""
+        self.logger.info(f"Importing {len(self.files)} files")
         
-        for idx, file_path in enumerate(file_paths):
-            self.logger.debug(f"Importing data from file {file_path} {idx+1}/{len(file_paths)}")
-            import_result = self._import_file(file_path, import_mode)
-            import_results.append(import_result)
+        # Ensure database is selected
+        if not self.database:
+            self.logger.error("No database specified for import")
+            raise ValueError("No database specified for import. Please specify a database in the configuration.")
             
-            # Display individual result using ASCII UI
-            self.ui.display_import_result(import_result)
+        # Ensure database exists and is selected
+        try:
+            self.db.execute(f"USE `{self.database}`")
+            self.logger.info(f"Selected database: {self.database}")
+        except Exception as e:
+            self.logger.error(f"Failed to select database {self.database}: {str(e)}")
+            raise ValueError(f"Failed to select database {self.database}: {str(e)}")
             
-            # Count statistics
-            if import_result.status == "success":
-                successful_imports += 1
-            elif import_result.status == "warning":
-                warnings += 1
-            elif import_result.status == "error":
-                errors += 1
+        # Organize files by type for proper import order
+        table_schema_files = []
+        table_data_files = []
+        triggers_files = []
+        procedures_files = []
+        views_files = []  
+        events_files = []
+        functions_files = []
+        user_types_files = []
         
-        # Display import summary
-        self.ui.display_import_summary(import_results)
+        # Sort files into their respective categories
+        for file in self.files:
+            filename = os.path.basename(file).lower()
+            if filename.endswith('_schema.sql'):
+                table_schema_files.append(file)
+            elif filename.endswith('_data.sql'):
+                table_data_files.append(file)
+            elif filename == 'triggers.sql':
+                triggers_files.append(file)
+            elif filename == 'procedures.sql':
+                procedures_files.append(file)
+            elif filename == 'views.sql':
+                views_files.append(file)
+            elif filename == 'events.sql':
+                events_files.append(file)
+            elif filename == 'functions.sql':
+                functions_files.append(file)
+            elif filename == 'user_types.sql':
+                user_types_files.append(file)
+                
+        # Check if we have each type of file
+        has_tables = len(table_schema_files) > 0
+        has_triggers = len(triggers_files) > 0
+        has_procedures = len(procedures_files) > 0
+        has_views = len(views_files) > 0
+        has_events = len(events_files) > 0
+        has_functions = len(functions_files) > 0
+        has_user_types = len(user_types_files) > 0
         
-        # Log overall stats
-        total_files = len(file_paths)
-        self.logger.info(f"Import completed: {successful_imports}/{total_files} files imported successfully, {warnings} with warnings, {errors} with errors")
+        # Skip, Merge, Overwrite, Force Drop, or Cancel
+        if self.config.mode == ImportMode.SKIP:
+            self.logger.info("Import mode: SKIP - Skipping existing objects")
+        elif self.config.mode == ImportMode.MERGE:  
+            self.logger.info("Import mode: MERGE - Merging with existing objects")
+        elif self.config.mode == ImportMode.OVERWRITE:
+            self.logger.info("Import mode: OVERWRITE - Overwriting existing objects")
+            if not self.config.force_drop:
+                self._handle_overwrite_mode(table_schema_files)
+        elif self.config.mode == ImportMode.CANCEL:
+            self.logger.info("Import mode: CANCEL - Will cancel on collision")
+            
+        # Handle force drop if configured
+        if self.config.force_drop:
+            self.logger.info("Force drop enabled - will drop existing objects")
+            self._force_drop_database_objects(has_tables, has_triggers, has_procedures, has_views, has_events, has_functions, has_user_types)
+        
+        # Statistics
+        stats = {
+            'start_time': time.time(),
+            'files_processed': 0,
+            'successful': 0,
+            'warnings': 0,
+            'errors': 0,
+            'tables_imported': 0,
+            'triggers_imported': 0,
+            'procedures_imported': 0,
+            'views_imported': 0,
+            'events_imported': 0,
+            'functions_imported': 0,
+            'user_types_imported': 0,
+            'data_rows_imported': 0
+        }
+        
+        # Disable foreign key checks if configured
+        if self.config.disable_foreign_keys:
+            try:
+                self.logger.info("Disabling foreign key checks")
+                self.db.execute("SET FOREIGN_KEY_CHECKS = 0")
+            except Exception as e:
+                self.logger.warning(f"Could not disable foreign key checks: {str(e)}")
+        
+        # Import in specific order: user types, tables, functions, procedures, views, triggers, events
+        try:
+            # 1. User-defined types first (if any)
+            if has_user_types and not self.config.exclude_user_types:
+                self.logger.info("Importing user-defined types")
+                for file in user_types_files:
+                    result = self._import_file(file)
+                    stats['files_processed'] += 1
+                    if result['success']:
+                        stats['successful'] += 1
+                        stats['user_types_imported'] += 1
+                    elif result['warning']:
+                        stats['warnings'] += 1
+                    else:
+                        stats['errors'] += 1
+            
+            # 2. Table schemas
+            if has_tables and not self.config.exclude_tables:
+                self.logger.info("Importing table schemas")
+                for file in table_schema_files:
+                    result = self._import_file(file)
+                    stats['files_processed'] += 1
+                    if result['success']:
+                        stats['successful'] += 1
+                        stats['tables_imported'] += 1
+                    elif result['warning']:
+                        stats['warnings'] += 1
+                    else:
+                        stats['errors'] += 1
+            
+            # 3. Table data
+            if has_tables and not self.config.exclude_data:
+                self.logger.info("Importing table data")
+                for file in table_data_files:
+                    result = self._import_file(file)
+                    stats['files_processed'] += 1
+                    if result['success']:
+                        stats['successful'] += 1
+                        stats['data_rows_imported'] += result.get('rows_affected', 0)
+                    elif result['warning']:
+                        stats['warnings'] += 1
+                    else:
+                        stats['errors'] += 1
+            
+            # 4. Functions
+            if has_functions and not self.config.exclude_functions:
+                self.logger.info("Importing functions")
+                for file in functions_files:
+                    result = self._import_file(file)
+                    stats['files_processed'] += 1
+                    if result['success']:
+                        stats['successful'] += 1
+                        stats['functions_imported'] += 1
+                    elif result['warning']:
+                        stats['warnings'] += 1
+                    else:
+                        stats['errors'] += 1
+            
+            # 5. Procedures
+            if has_procedures and not self.config.exclude_procedures:
+                self.logger.info("Importing procedures")
+                for file in procedures_files:
+                    result = self._import_file(file)
+                    stats['files_processed'] += 1
+                    if result['success']:
+                        stats['successful'] += 1
+                        stats['procedures_imported'] += 1
+                    elif result['warning']:
+                        stats['warnings'] += 1
+                    else:
+                        stats['errors'] += 1
+            
+            # 6. Views
+            if has_views and not self.config.exclude_views:
+                self.logger.info("Importing views")
+                for file in views_files:
+                    result = self._import_file(file)
+                    stats['files_processed'] += 1
+                    if result['success']:
+                        stats['successful'] += 1
+                        stats['views_imported'] += 1
+                    elif result['warning']:
+                        stats['warnings'] += 1
+                    else:
+                        stats['errors'] += 1
+            
+            # 7. Triggers
+            if has_triggers and not self.config.exclude_triggers:
+                self.logger.info("Importing triggers")
+                for file in triggers_files:
+                    result = self._import_file(file)
+                    stats['files_processed'] += 1
+                    if result['success']:
+                        stats['successful'] += 1
+                        stats['triggers_imported'] += 1
+                    elif result['warning']:
+                        stats['warnings'] += 1
+                    else:
+                        stats['errors'] += 1
+            
+            # 8. Events
+            if has_events and not self.config.exclude_events:
+                self.logger.info("Importing events")
+                for file in events_files:
+                    result = self._import_file(file)
+                    stats['files_processed'] += 1
+                    if result['success']:
+                        stats['successful'] += 1
+                        stats['events_imported'] += 1
+                    elif result['warning']:
+                        stats['warnings'] += 1
+                    else:
+                        stats['errors'] += 1
+        
+        finally:
+            # Re-enable foreign key checks if they were disabled
+            if self.config.disable_foreign_keys:
+                try:
+                    self.logger.info("Re-enabling foreign key checks")
+                    self.db.execute("SET FOREIGN_KEY_CHECKS = 1")
+                except Exception as e:
+                    self.logger.warning(f"Could not re-enable foreign key checks: {str(e)}")
+        
+        # Calculate execution time
+        stats['end_time'] = time.time()
+        stats['execution_time'] = stats['end_time'] - stats['start_time']
+        
+        # Log import summary
+        self.logger.info(f"Import completed in {stats['execution_time']:.2f} seconds. "
+                         f"Success: {stats['successful']}, Warnings: {stats['warnings']}, Errors: {stats['errors']}")
+        
+        # Print detailed summary
+        print("\nImport Summary:")
+        print(f"Total time: {stats['execution_time']:.2f} seconds")
+        print(f"Files processed: {stats['files_processed']}")
+        print(f"Successful: {stats['successful']}")
+        print(f"Warnings: {stats['warnings']}")
+        print(f"Errors: {stats['errors']}")
+        print("\nImported Objects:")
+        objects_imported = []
+        if stats['tables_imported'] > 0:
+            objects_imported.append(f"  - Tables: {stats['tables_imported']}")
+        if stats['triggers_imported'] > 0:
+            objects_imported.append(f"  - Triggers: {stats['triggers_imported']}")
+        if stats['procedures_imported'] > 0:
+            objects_imported.append(f"  - Procedures: {stats['procedures_imported']}")
+        if stats['views_imported'] > 0:
+            objects_imported.append(f"  - Views: {stats['views_imported']}")
+        if stats['events_imported'] > 0:
+            objects_imported.append(f"  - Events: {stats['events_imported']}")
+        if stats['functions_imported'] > 0:
+            objects_imported.append(f"  - Functions: {stats['functions_imported']}")
+        if stats['user_types_imported'] > 0:
+            objects_imported.append(f"  - User Types: {stats['user_types_imported']}")
+        if stats['data_rows_imported'] > 0:
+            objects_imported.append(f"  - Data Rows: {stats['data_rows_imported']}")
+            
+        if not objects_imported:
+            objects_imported.append("  - Other: 0")
+            
+        print("\n".join(objects_imported))
+        
+        # Return results
+        return {
+            'success': stats['errors'] == 0,
+            'stats': stats
+        }
 
     def _calculate_file_checksum(self, file_path: str) -> Optional[str]:
         """Calculate MD5 checksum for a file.
@@ -116,16 +428,19 @@ class ImportService:
             hours = seconds / 3600
             return f"{hours:.1f} hours"
     
-    def _get_mapped_table_name(self, original_table: str) -> str:
-        """Get mapped table name if mapping exists.
+    def _get_mapped_table_name(self, table_name: str) -> str:
+        """Get mapped table name if a mapping exists.
         
         Args:
-            original_table: Original table name
+            table_name: Original table name
             
         Returns:
-            Mapped table name or original if no mapping exists
+            Mapped table name or original name if no mapping exists
         """
-        return self.table_mapping.get(original_table, original_table)
+        if not hasattr(self, 'table_mapping') or not self.table_mapping:
+            return table_name
+            
+        return self.table_mapping.get(table_name, table_name)
     
     def _count_statements_in_files(self, files: List[str]) -> int:
         """Count the total number of SQL statements in all files.
@@ -147,57 +462,47 @@ class ImportService:
                 logger.warning(f"Error counting statements in {file_path}: {str(e)}")
         return total
             
-    def _read_file_with_multiple_encodings(self, file_path: str, max_size: int = 10240) -> str:
-        """Read file content using multiple encodings.
+    def _read_file_with_multiple_encodings(self, file_path, max_size=None):
+        """Read file content trying multiple encodings.
         
         Args:
             file_path: Path to the file
             max_size: Maximum size to read (in KB)
             
         Returns:
-            File content as string or empty string if reading fails
+            File content as a string
         """
-        # Common encodings to try
-        encodings = [
-            'utf-8', 'latin1', 'cp1252', 
-            'ascii', 'utf-16', 'utf-32',
-            'iso-8859-1', 'iso-8859-2', 'iso-8859-15',
-            'windows-1250', 'windows-1251', 'windows-1252',
-            'windows-1253', 'windows-1254', 'windows-1255',
-            'windows-1256', 'windows-1257', 'windows-1258',
-            'mac-roman', 'mac-cyrillic', 'mac-greek',
-            'cp437', 'cp850', 'cp866', 'cp932', 'cp949', 'cp950',
-            'koi8-r', 'koi8-u', 'gb2312', 'gbk', 'big5', 
-            'euc-jp', 'euc-kr', 'shift-jis', 'hz'
-        ]
+        # Encodings to try in order
+        encodings = ['utf-8', 'utf-16', 'latin-1', 'iso-8859-1', 'cp1252']
+        content = None
         
-        # Check if file exists
-        if not os.path.isfile(file_path):
-            self.logger.error(f"File not found: {file_path}")
-            return ""
-        
-        # Calculate max bytes to read
-        max_bytes = max_size * 1024
-        
-        # Try each encoding
         for encoding in encodings:
             try:
-                with open(file_path, 'r', encoding=encoding) as f:
-                    content = f.read(max_bytes)
-                    self.logger.debug(f"Successfully read file using encoding: {encoding}")
-                    return content
+                if max_size:
+                    # Read only the first max_size KB
+                    with open(file_path, 'r', encoding=encoding) as f:
+                        content = f.read(max_size * 1024)
+                else:
+                    # Read the entire file
+                    with open(file_path, 'r', encoding=encoding) as f:
+                        content = f.read()
+                
+                # If we got here, the encoding worked
+                self.logger.debug(f"Successfully read file {file_path} with encoding {encoding}")
+                break
             except UnicodeDecodeError:
+                # Try the next encoding
+                self.logger.debug(f"Failed to read file {file_path} with encoding {encoding}")
                 continue
+            except Exception as e:
+                # Other error occurred
+                self.logger.error(f"Error reading file {file_path}: {str(e)}")
+                return None
         
-        # If all encodings fail, try with replacement
-        try:
-            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-                content = f.read(max_bytes)
-                self.logger.warning(f"Reading file with 'replace' error handler - some characters may be replaced: {file_path}")
-                return content
-        except Exception as e:
-            self.logger.error(f"Error reading file with all encodings: {str(e)}")
-            return ""
+        if content is None:
+            self.logger.warning(f"Could not read file {file_path} with any encoding")
+            
+        return content
 
     def _extract_database_name_from_file(self, file_path: Path) -> Optional[str]:
         """Extract database name from a SQL file.
@@ -323,244 +628,111 @@ class ImportService:
         return result
 
     def _extract_expected_row_count(self, file_path: str) -> int:
-        """Extract expected row count from SQL file.
-
-        Args:
-            file_path: Path to SQL file.
-
-        Returns:
-            Expected row count or 0 if not found.
-        """
-        expected_rows = 0
-        try:
-            content = self._read_file_with_multiple_encodings(file_path)
-            if not content:
-                return 0
-            
-            # Look for comments indicating expected row count
-            row_count_patterns = [
-                r'--\s*Expected\s+rows:\s*(\d+)',
-                r'#\s*Expected\s+rows:\s*(\d+)',
-                r'/\*\s*Expected\s+rows:\s*(\d+)\s*\*/',
-                r'--\s*Rows:\s*(\d+)',
-                r'#\s*Rows:\s*(\d+)',
-                r'/\*\s*Rows:\s*(\d+)\s*\*/'
-            ]
-            
-            for pattern in row_count_patterns:
-                match = re.search(pattern, content, re.IGNORECASE)
-                if match:
-                    expected_rows = int(match.group(1))
-                    self.logger.debug(f"Found expected row count: {expected_rows}")
-                    break
-                
-            # If no explicit count found, try to count INSERT values
-            if expected_rows == 0:
-                # For multi-row insert statements like INSERT INTO x VALUES (...), (...), (...)
-                insert_matches = re.finditer(r'INSERT\s+(?:IGNORE\s+)?INTO\s+[^(]+\s+VALUES\s*\(', content, re.IGNORECASE)
-                for match in insert_matches:
-                    # Find the insert statement start
-                    pos = match.end()
-                    # Count the number of value groups (each group starts with a parenthesis)
-                    paren_count = 1  # Start with the opening parenthesis we already found
-                    value_groups = 1  # Start with the first group
-                    in_string = False
-                    string_char = None
-                    escaped = False
-                    
-                    for i in range(pos, len(content)):
-                        char = content[i]
-                        
-                        # Handle string literals
-                        if char in ['"', "'"] and not escaped:
-                            if not in_string:
-                                in_string = True
-                                string_char = char
-                            elif char == string_char:
-                                in_string = False
-                        
-                        # Skip characters in string literals
-                        if in_string:
-                            escaped = char == '\\'
-                            continue
-                        
-                        # Count parentheses
-                        if char == '(':
-                            paren_count += 1
-                        elif char == ')':
-                            paren_count -= 1
-                            if paren_count == 0:
-                                # End of values, break out
-                                break
-                        
-                        # Count value groups (pattern: ),(
-                        if char == ',' and content[i+1:i+2] == '(':
-                            value_groups += 1
-                    
-                    expected_rows += value_groups
-                
-        except Exception as e:
-            self.logger.warning(f"Error extracting expected row count: {str(e)}")
-        
-        return expected_rows
-
-    def _process_sql_file(self, file_path: str) -> tuple:
-        """Process an SQL file to extract database name, table name, and SQL statements.
+        """Extract expected row count from file content or filename.
         
         Args:
             file_path: Path to the SQL file
             
         Returns:
-            Tuple containing (database_name, create_statements, data_statement, table_name, expected_rows)
+            Expected row count or 0 if not found
+        """
+        try:
+            # First try to get from filename, e.g. tablename_1000_data.sql
+            file_name = os.path.basename(file_path)
+            file_parts = os.path.splitext(file_name)[0].split('_')
+            
+            # Look for numeric part in filename
+            for part in file_parts:
+                if part.isdigit():
+                    expected_rows = int(part)
+                    self.logger.debug(f"Found expected row count from filename: {expected_rows}")
+                    return expected_rows
+            
+            # If not found in filename, try to extract from file content
+            content = self._read_file_with_multiple_encodings(file_path, max_size=10)  # Read just the beginning
+            if not content:
+                return 0
+                
+            # Look for a comment with row count info
+            # e.g. -- Rows: 1000
+            row_match = re.search(r'--\s*Rows:\s*(\d+)', content, re.IGNORECASE)
+            if row_match:
+                expected_rows = int(row_match.group(1))
+                self.logger.debug(f"Found expected row count from file comment: {expected_rows}")
+                return expected_rows
+                
+            # Try to count INSERT statements
+            if content.upper().count('INSERT INTO') > 0:
+                # Read full file for accurate count
+                full_content = self._read_file_with_multiple_encodings(file_path)
+                if full_content:
+                    # Count VALUES clauses
+                    values_count = full_content.upper().count('VALUES')
+                    if values_count > 0:
+                        self.logger.debug(f"Estimated {values_count} rows from INSERT statements")
+                        return values_count
+                        
+            return 0
+        except Exception as e:
+            self.logger.warning(f"Error extracting expected row count: {str(e)}")
+            return 0
+
+    def _process_sql_file(self, file_path: str) -> tuple:
+        """Process a SQL file by executing each statement.
+        
+        Args:
+            file_path: Path to the SQL file
+            
+        Returns:
+            Tuple of (statements_count, executed_count, errors)
         """
         self.logger.debug(f"Processing SQL file: {file_path}")
         
-        # Read the file content with multiple encoding support
-        content = self._read_file_with_multiple_encodings(file_path)
-        if not content:
-            raise ValueError(f"Could not read file content with any supported encoding: {file_path}")
+        statements_count = 0
+        executed_count = 0
+        errors = []
         
-        # Extract expected row count
-        expected_rows = self._extract_expected_row_count(file_path)
-        
-        # Split content into statements
-        statements = []
-        current_statement = []
-        in_string = False
-        string_char = None
-        in_comment = False
-        comment_type = None
-        
-        for line in content.split('\n'):
-            line = line.strip()
-            if not line:
-                continue
+        try:
+            # Read file content
+            content = self._read_file_with_multiple_encodings(file_path)
+            if not content:
+                self.logger.warning(f"Could not read file or file is empty: {file_path}")
+                return 0, 0, ["File is empty or could not be read"]
             
-            # Skip comment lines
-            if line.startswith('--') or line.startswith('#'):
-                continue
+            # Split content into statements
+            statements = sqlparse.split(content)
+            statements = [stmt.strip() for stmt in statements if stmt.strip()]
+            statements_count = len(statements)
             
-            current_statement.append(line)
+            if statements_count == 0:
+                self.logger.warning(f"No SQL statements found in file: {file_path}")
+                return 0, 0, []
             
-            if line.endswith(';'):
-                statements.append(' '.join(current_statement))
-                current_statement = []
-        
-        # Add any remaining statement
-        if current_statement:
-            statements.append(' '.join(current_statement))
-        
-        # Identify database name
-        db_name = None
-        
-        # First try to extract from USE statement
-        for stmt in statements:
-            if stmt.upper().startswith('USE '):
-                match = re.search(r'USE\s+[`"]?([a-zA-Z0-9_]+)[`"]?', stmt, re.IGNORECASE)
-                if match:
-                    db_name = match.group(1)
-                    self.logger.info(f"Found database name from USE statement: {db_name}")
-                    break
-        
-        # If not found, try to extract from file path
-        if not db_name:
-            # Try to extract from directory structure
-            path_parts = os.path.abspath(file_path).split(os.sep)
-            for part in reversed(path_parts[:-1]):  # Skip the filename itself
-                if part and not part.startswith('.') and part not in ['sql', 'scripts', 'database', 'dump']:
-                    db_name = part
-                    self.logger.info(f"Using database name from path: {db_name}")
-                    break
-        
-        # If still not found, try to extract from CREATE/INSERT statements
-        if not db_name:
+            # Execute each statement
             for stmt in statements:
-                # Check for explicit database references in statements
-                db_match = re.search(r'(?:CREATE\s+TABLE|INSERT\s+INTO)\s+[`"]?([a-zA-Z0-9_]+)[`"]?\.[`"]?([a-zA-Z0-9_]+)[`"]?', 
-                                   stmt, re.IGNORECASE)
-                if db_match:
-                    db_name = db_match.group(1)
-                    self.logger.info(f"Found database name from SQL statement: {db_name}")
-                    break
-        
-        # If still not found, use the file name as a fallback
-        if not db_name:
-            base_name = os.path.basename(file_path)
-            if '_' in base_name:
-                # Try to use part of the filename before underscore
-                db_name = base_name.split('_')[0]
-                self.logger.info(f"Using database name from filename: {db_name}")
-            else:
-                # Remove extension
-                db_name = os.path.splitext(base_name)[0]
-                self.logger.info(f"Using database name from filename without extension: {db_name}")
-        
-        # Identify table name
-        table_name = None
-        
-        # Try to extract table name from CREATE TABLE statement
-        for stmt in statements:
-            if 'CREATE TABLE' in stmt.upper():
-                create_match = re.search(r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:`?([^`\s\.]+)`?\.)?`?([^`\s(]+)`?', 
-                                        stmt, re.IGNORECASE)
-                if create_match:
-                    if create_match.group(1):  # Database name present
-                        if not db_name:
-                            db_name = create_match.group(1)
-                        table_name = create_match.group(2)
-                    else:
-                        table_name = create_match.group(2)
-                    
-                    self.logger.info(f"Found table name from CREATE TABLE: {table_name}")
-                    break
-        
-        # If not found, try to extract from INSERT INTO statement
-        if not table_name:
-            for stmt in statements:
-                if stmt.upper().startswith('INSERT'):
-                    insert_match = re.search(r'INSERT\s+(?:IGNORE\s+)?INTO\s+(?:`?([^`\s\.]+)`?\.)?`?([^`\s(]+)`?', 
-                                           stmt, re.IGNORECASE)
-                    if insert_match:
-                        if insert_match.group(1):  # Database name present
-                            if not db_name:
-                                db_name = insert_match.group(1)
-                            table_name = insert_match.group(2)
-                        else:
-                            table_name = insert_match.group(2)
+                try:
+                    if 'DELIMITER' in stmt.upper():
+                        # Skip DELIMITER statements, they are handled in _process_delimiter_sql_file
+                        continue
                         
-                        self.logger.info(f"Found table name from INSERT statement: {table_name}")
-                        break
-        
-        # If still not found, use the file name
-        if not table_name:
-            base_name = os.path.basename(file_path)
-            # Remove common suffixes and extension
-            for suffix in ['_data', '_schema', '_table', '_dump']:
-                if base_name.endswith(suffix + '.sql'):
-                    table_name = base_name[:-len(suffix + '.sql')]
-                    break
-            if not table_name:
-                # Just remove extension
-                table_name = os.path.splitext(base_name)[0]
+                    # Execute the statement
+                    self.db.execute(stmt)
+                    executed_count += 1
+                except Exception as e:
+                    error_msg = f"Error executing statement: {str(e)}\nStatement: {stmt[:200]}..."
+                    self.logger.error(error_msg)
+                    errors.append(error_msg)
+                    
+                    # Stop on error unless configured to continue
+                    if not hasattr(self.config, 'continue_on_error') or not self.config.continue_on_error:
+                        return statements_count, executed_count, errors
             
-            self.logger.info(f"Using table name from filename: {table_name}")
-        
-        # Separate CREATE statements from data statements
-        create_statements = []
-        data_statement = None
-        
-        for stmt in statements:
-            stmt_upper = stmt.upper()
-            if 'CREATE' in stmt_upper:
-                create_statements.append(stmt)
-            elif 'INSERT' in stmt_upper:
-                if data_statement:
-                    # Append to existing data statement
-                    data_statement += "; " + stmt
-                else:
-                    data_statement = stmt
-        
-        return db_name, create_statements, data_statement, table_name, expected_rows
+            return statements_count, executed_count, errors
+            
+        except Exception as e:
+            error_msg = f"Error processing file {file_path}: {str(e)}"
+            self.logger.error(error_msg)
+            return statements_count, executed_count, [error_msg]
 
     def _handle_import_mode(self, table_name: str, import_mode: str) -> None:
         """Handle import mode for existing tables.
@@ -587,119 +759,178 @@ class ImportService:
             self.db.execute(f"TRUNCATE TABLE `{table_name}`")
         # MERGE mode doesn't need any special handling - it will just add data
 
-    def _import_file(self, file_path, import_mode: str) -> ImportResult:
-        """Import data from a single file.
-
+    def _import_file(self, file_path: str) -> dict:
+        """Import a file containing SQL statements.
+        
         Args:
-            file_path: Path to file.
-            import_mode: Mode to use when importing data.
-
+            file_path: Path to the file to import
+            
         Returns:
-            ImportResult: Object containing information about the import operation.
+            Dictionary with import result information
         """
-        start_time = time.time()
-        result = ImportResult(
-            file_name=os.path.basename(file_path),
-            source_path=str(file_path),
-            status="error",  # Default to error, will be updated on success
-            table_name="",
-            rows_imported=0,
-            expected_rows=0,
-            error_message="",
-            duration=0,
-            warnings=[]
-        )
+        result = {
+            'success': False,
+            'warning': False,
+            'error': None,
+            'file': os.path.basename(file_path),
+            'rows_affected': 0
+        }
+        
+        file_content = self._read_file_with_multiple_encodings(file_path)
+        if not file_content:
+            self.logger.error(f"Could not read file {file_path}")
+            result['error'] = f"Could not read file {file_path}"
+            return result
+        
+        # If this is a schema file, extract table name
+        filename = os.path.basename(file_path)
+        if filename.endswith('_schema.sql'):
+            table_name = filename.replace('_schema.sql', '')
+            self.logger.info(f"Importing schema for table {table_name}")
+        
+        # Check if the file is valid SQL
+        if not file_content.strip():
+            self.logger.warning(f"File {file_path} is empty or contains only whitespace")
+            result['warning'] = True
+            result['success'] = True
+            return result
+        
+        # Process SQL statements from the file
+        try:
+            # Apply delimiter handling logic
+            sql_statements = self._split_sql_statements(file_content)
+            if not sql_statements:
+                self.logger.warning(f"No SQL statements found in file {file_path}")
+                result['warning'] = True
+                result['success'] = True
+                return result
+            
+            total_affected = 0
+            for sql in sql_statements:
+                if not sql.strip():
+                    continue
+                
+                try:
+                    # Execute the SQL statement
+                    affected = self.db.execute(sql)
+                    total_affected += affected if affected is not None else 0
+                    
+                except Exception as e:
+                    error_message = str(e)
+                    
+                    # Check if it's a duplicate object error and mode is SKIP
+                    if self.config.mode == ImportMode.SKIP and (
+                        "already exists" in error_message or 
+                        "Duplicate" in error_message
+                    ):
+                        self.logger.info(f"Skipping existing object: {error_message}")
+                        result['warning'] = True
+                        continue
+                    
+                    # If in CONTINUE_ON_ERROR mode, log the error but don't stop
+                    if self.config.continue_on_error:
+                        self.logger.warning(f"Error executing statement: {error_message}")
+                        result['warning'] = True
+                        continue
+                    
+                    # Otherwise, fail the import
+                    self.logger.error(f"Error executing statement: {error_message}")
+                    result['error'] = f"Failed to execute SQL: {error_message}"
+                    return result
+            
+            # Success!
+            result['success'] = True
+            result['rows_affected'] = total_affected
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Error processing file {file_path}: {str(e)}")
+            result['error'] = f"Error processing file: {str(e)}"
+            return result
+
+    def _process_delimiter_sql_file(self, file_path: str) -> tuple:
+        """Process SQL file with DELIMITER statements for triggers, procedures, etc.
+        
+        Args:
+            file_path: Path to the SQL file
+            
+        Returns:
+            Tuple of (statements_count, executed_count, errors)
+        """
+        self.logger.debug(f"Processing delimiter-based SQL file: {file_path}")
+        
+        statements_count = 0
+        executed_count = 0
+        errors = []
         
         try:
-            # Check if file exists
-            if not os.path.isfile(file_path):
-                result.error_message = f"File not found: {file_path}"
-                return result
+            # Read file content
+            content = self._read_file_with_multiple_encodings(file_path)
+            if not content:
+                self.logger.warning(f"Could not read file or file is empty: {file_path}")
+                return 0, 0, ["File is empty or could not be read"]
             
-            # Process the file to extract database name and SQL content
-            try:
-                db_name, create_statements, data_statement, table_name, expected_rows = self._process_sql_file(file_path)
-                result.table_name = table_name or os.path.basename(file_path).split('.')[0]
-                result.expected_rows = expected_rows
-            except Exception as e:
-                error_msg = f"Error processing SQL file: {str(e)}"
-                self.logger.error(error_msg)
-                result.error_message = error_msg
-                return result
+            # Split content by DELIMITER statements
+            delimiter_blocks = re.split(r'(?i)DELIMITER\s+([^\n;]+)', content)
             
-            # Check if database was properly identified
-            if not db_name:
-                error_msg = "No database selected or created from SQL file"
-                self.logger.error(error_msg)
-                result.error_message = error_msg
-                return result
+            current_delimiter = ';'
+            current_block = ''
             
-            # Connect to the database
-            try:
-                self.db.connect()
-                
-                # Select or create the database
-                if not self.db.database_exists(db_name):
-                    self.logger.info(f"Creating database {db_name}")
-                    self.db.create_database(db_name)
-                
-                self.db.select_database(db_name)
-                
-                # Execute create statements
-                for statement in create_statements:
-                    try:
-                        self.db.execute(statement)
-                        self.logger.debug(f"Executed table structure statement")
-                    except Exception as e:
-                        result.warnings.append(f"Error executing create statement: {str(e)}")
-                        self.logger.warning(f"Error executing create statement: {str(e)}")
-                
-                # Check if table exists
-                if not table_name or not self.db.table_exists(table_name):
-                    error_msg = f"Table {table_name} not found after executing create statements"
-                    self.logger.error(error_msg)
-                    result.error_message = error_msg
-                    return result
-                
-                # Handle import mode
-                self._handle_import_mode(table_name, import_mode)
-                
-                # Execute data statements
-                if data_statement:
-                    try:
-                        affected_rows = self.db.execute(data_statement)
-                        self.logger.debug(f"Executed data statement, affected rows: {affected_rows}")
-                        result.rows_imported = affected_rows
-                    except Exception as e:
-                        error_msg = f"Error executing data statement: {str(e)}"
-                        self.logger.error(error_msg)
-                        result.error_message = error_msg
-                        return result
-                
-                # Validate imported table data
-                validation_result = self._validate_imported_table(table_name, result.expected_rows, result.rows_imported)
-                if validation_result.get("status") == "warning":
-                    result.status = "warning"
-                    result.error_message = validation_result.get("message", "")
+            # Process each block
+            for i, block in enumerate(delimiter_blocks):
+                if i == 0:
+                    # First block (before any DELIMITER statement)
+                    current_block = block
+                elif i % 2 == 1:
+                    # This is a new delimiter definition
+                    current_delimiter = block.strip()
                 else:
-                    # If we reach here, import was successful
-                    result.status = "success"
+                    # This is a block with the previously defined delimiter
+                    current_block = block
                 
-            except Exception as e:
-                error_msg = f"Database error: {str(e)}"
-                self.logger.error(error_msg)
-                result.error_message = error_msg
-                return result
-            finally:
-                self.db.disconnect()
+                # Skip empty blocks
+                if not current_block.strip():
+                    continue
+                
+                # Split the block by the current delimiter
+                if current_delimiter != ';':
+                    # For custom delimiters, we need to be careful about how we split
+                    raw_statements = current_block.split(current_delimiter)
+                else:
+                    # For standard delimiter, use sqlparse to handle nested semicolons better
+                    raw_statements = sqlparse.split(current_block)
+                
+                # Process each statement in the block
+                for stmt in raw_statements:
+                    stmt = stmt.strip()
+                    if not stmt:
+                        continue
+                    
+                    # Replace any remaining custom delimiters with semicolons for execution
+                    if current_delimiter != ';':
+                        stmt = stmt.replace(current_delimiter, ';')
+                    
+                    statements_count += 1
+                    
+                    try:
+                        # Execute the statement
+                        self.db.execute(stmt)
+                        executed_count += 1
+                    except Exception as e:
+                        error_msg = f"Error executing statement: {str(e)}\nStatement: {stmt[:200]}..."
+                        self.logger.error(error_msg)
+                        errors.append(error_msg)
+                        
+                        # Stop on error unless configured to continue
+                        if not hasattr(self.config, 'continue_on_error') or not self.config.continue_on_error:
+                            return statements_count, executed_count, errors
+            
+            return statements_count, executed_count, errors
+            
         except Exception as e:
-            error_msg = f"Unexpected error during import: {str(e)}"
+            error_msg = f"Error processing file {file_path}: {str(e)}"
             self.logger.error(error_msg)
-            result.error_message = error_msg
-        
-        # Calculate duration
-        result.duration = time.time() - start_time
-        return result
+            return statements_count, executed_count, [error_msg]
 
     def _import_table(self, table: str) -> None:
         """Import a single table."""
@@ -750,4 +981,332 @@ class ImportService:
             
         except Exception as e:
             logger.error(f"Error reading schema file {schema_file}: {str(e)}")
-            return None 
+            return None
+
+    def _force_drop_database_objects(self, has_tables: bool, has_triggers: bool, has_procedures: bool, has_views: bool, has_events: bool, has_functions: bool, has_user_types: bool) -> None:
+        """Force drop specific database objects being imported.
+        
+        Only drops objects that are being imported, not all objects in the database.
+        This protects objects in the target environment that aren't part of the import.
+        """
+        self.logger.info("Force dropping database objects that match import files")
+        
+        # Extract object names from the import files
+        tables_to_drop = []
+        triggers_to_drop = []
+        procedures_to_drop = []
+        views_to_drop = []
+        events_to_drop = []
+        functions_to_drop = []
+        user_types_to_drop = []
+        
+        # First pass: identify objects to be imported
+        for file in self.files:
+            filename = os.path.basename(file).lower()
+            
+            # Extract table names from schema files
+            if filename.endswith('_schema.sql'):
+                table_name = filename.replace('_schema.sql', '')
+                tables_to_drop.append(table_name)
+                
+            # For other object types, we need to extract names from file content
+            file_content = self._read_file_with_multiple_encodings(file)
+            if not file_content:
+                continue
+                
+            # Check for each object type
+            if filename == 'triggers.sql':
+                # Extract trigger names
+                trigger_matches = re.findall(r'CREATE\s+(?:DEFINER\s*=\s*[^\s]+\s+)?TRIGGER\s+[`"]?([^\s`"]+)[`"]?', 
+                                              file_content, re.IGNORECASE)
+                triggers_to_drop.extend(trigger_matches)
+                
+            elif filename == 'procedures.sql':
+                # Extract procedure names
+                procedure_matches = re.findall(r'CREATE\s+(?:DEFINER\s*=\s*[^\s]+\s+)?PROCEDURE\s+[`"]?([^\s`"(]+)[`"]?', 
+                                                file_content, re.IGNORECASE)
+                procedures_to_drop.extend(procedure_matches)
+                
+            elif filename == 'views.sql':
+                # Extract view names
+                view_matches = re.findall(r'CREATE\s+(?:OR\s+REPLACE\s+)?(?:DEFINER\s*=\s*[^\s]+\s+)?(?:SQL\s+SECURITY\s+[^\s]+\s+)?VIEW\s+[`"]?([^\s`"]+)[`"]?', 
+                                           file_content, re.IGNORECASE)
+                views_to_drop.extend(view_matches)
+                
+            elif filename == 'events.sql':
+                # Extract event names
+                event_matches = re.findall(r'CREATE\s+(?:DEFINER\s*=\s*[^\s]+\s+)?EVENT\s+[`"]?([^\s`"]+)[`"]?', 
+                                            file_content, re.IGNORECASE)
+                events_to_drop.extend(event_matches)
+                
+            elif filename == 'functions.sql':
+                # Extract function names
+                function_matches = re.findall(r'CREATE\s+(?:DEFINER\s*=\s*[^\s]+\s+)?FUNCTION\s+[`"]?([^\s`"(]+)[`"]?', 
+                                               file_content, re.IGNORECASE)
+                functions_to_drop.extend(function_matches)
+                
+            elif filename == 'user_types.sql':
+                # Extract user-defined type names
+                type_matches = re.findall(r'CREATE\s+TYPE\s+[`"]?([^\s`"]+)[`"]?', 
+                                           file_content, re.IGNORECASE)
+                user_types_to_drop.extend(type_matches)
+        
+        # Remove duplicates
+        tables_to_drop = list(set(tables_to_drop))
+        triggers_to_drop = list(set(triggers_to_drop))
+        procedures_to_drop = list(set(procedures_to_drop))
+        views_to_drop = list(set(views_to_drop))
+        events_to_drop = list(set(events_to_drop))
+        functions_to_drop = list(set(functions_to_drop))
+        user_types_to_drop = list(set(user_types_to_drop))
+        
+        # Log what will be dropped
+        self.logger.info(f"Objects to drop: {len(tables_to_drop)} tables, {len(triggers_to_drop)} triggers, "
+                         f"{len(procedures_to_drop)} procedures, {len(views_to_drop)} views, "
+                         f"{len(events_to_drop)} events, {len(functions_to_drop)} functions, "
+                         f"{len(user_types_to_drop)} user types")
+        
+        # Drop objects in reverse dependency order
+        try:
+            # Disable foreign key checks temporarily
+            self.db.execute("SET FOREIGN_KEY_CHECKS = 0")
+            
+            # Drop triggers
+            if has_triggers and triggers_to_drop:
+                self.logger.info(f"Dropping {len(triggers_to_drop)} triggers: {', '.join(triggers_to_drop)}")
+                for trigger in triggers_to_drop:
+                    try:
+                        self.db.execute(f"DROP TRIGGER IF EXISTS `{trigger}`")
+                    except Exception as e:
+                        self.logger.warning(f"Error dropping trigger {trigger}: {str(e)}")
+            
+            # Drop views
+            if has_views and views_to_drop:
+                self.logger.info(f"Dropping {len(views_to_drop)} views: {', '.join(views_to_drop)}")
+                for view in views_to_drop:
+                    try:
+                        self.db.execute(f"DROP VIEW IF EXISTS `{view}`")
+                    except Exception as e:
+                        self.logger.warning(f"Error dropping view {view}: {str(e)}")
+            
+            # Drop events
+            if has_events and events_to_drop:
+                self.logger.info(f"Dropping {len(events_to_drop)} events: {', '.join(events_to_drop)}")
+                for event in events_to_drop:
+                    try:
+                        self.db.execute(f"DROP EVENT IF EXISTS `{event}`")
+                    except Exception as e:
+                        self.logger.warning(f"Error dropping event {event}: {str(e)}")
+            
+            # Drop functions
+            if has_functions and functions_to_drop:
+                self.logger.info(f"Dropping {len(functions_to_drop)} functions: {', '.join(functions_to_drop)}")
+                for function in functions_to_drop:
+                    try:
+                        self.db.execute(f"DROP FUNCTION IF EXISTS `{function}`")
+                    except Exception as e:
+                        self.logger.warning(f"Error dropping function {function}: {str(e)}")
+            
+            # Drop procedures
+            if has_procedures and procedures_to_drop:
+                self.logger.info(f"Dropping {len(procedures_to_drop)} procedures: {', '.join(procedures_to_drop)}")
+                for procedure in procedures_to_drop:
+                    try:
+                        self.db.execute(f"DROP PROCEDURE IF EXISTS `{procedure}`")
+                    except Exception as e:
+                        self.logger.warning(f"Error dropping procedure {procedure}: {str(e)}")
+            
+            # Drop tables
+            if has_tables and tables_to_drop:
+                self.logger.info(f"Dropping {len(tables_to_drop)} tables: {', '.join(tables_to_drop)}")
+                for table in tables_to_drop:
+                    try:
+                        self.db.execute(f"DROP TABLE IF EXISTS `{table}`")
+                    except Exception as e:
+                        self.logger.warning(f"Error dropping table {table}: {str(e)}")
+            
+            # Drop user types (last, as they might be used by other objects)
+            if has_user_types and user_types_to_drop:
+                self.logger.info(f"Dropping {len(user_types_to_drop)} user types: {', '.join(user_types_to_drop)}")
+                for user_type in user_types_to_drop:
+                    try:
+                        self.db.execute(f"DROP TYPE IF EXISTS `{user_type}`")
+                    except Exception as e:
+                        self.logger.warning(f"Error dropping user type {user_type}: {str(e)}")
+                        
+            # Re-enable foreign key checks
+            self.db.execute("SET FOREIGN_KEY_CHECKS = 1")
+            
+            self.logger.info("Successfully dropped specified database objects")
+            
+        except Exception as e:
+            self.logger.error(f"Error during force drop operation: {str(e)}")
+            # Re-enable foreign key checks in case of error
+            try:
+                self.db.execute("SET FOREIGN_KEY_CHECKS = 1")
+            except:
+                pass
+            raise
+
+    def _handle_overwrite_mode(self, table_schema_files: List[str]) -> None:
+        """Handle OVERWRITE mode by truncating tables instead of dropping them."""
+        self.logger.info("Handling OVERWRITE mode by truncating tables")
+        
+        # Get the current tables in the database
+        try:
+            current_tables = self.db.get_table_names()
+            if not current_tables:
+                self.logger.info("No existing tables to truncate")
+                return
+                
+            # Extract table names from schema files
+            table_names = []
+            for file_path in table_schema_files:
+                filename = os.path.basename(file_path)
+                table_name = filename.replace('_schema.sql', '')
+                table_names.append(table_name)
+                
+            # Find tables that exist both in the database and in our import list
+            tables_to_truncate = [table for table in current_tables if table in table_names]
+            
+            if not tables_to_truncate:
+                self.logger.info("No matching tables to truncate")
+                return
+                
+            self.logger.info(f"Truncating {len(tables_to_truncate)} tables")
+            
+            # Disable foreign key checks to avoid constraint errors
+            self.db.execute("SET FOREIGN_KEY_CHECKS = 0")
+            
+            # Truncate each table
+            for table in tables_to_truncate:
+                self.logger.info(f"Truncating table {table}")
+                self.db.execute(f"TRUNCATE TABLE `{table}`")
+                
+            # Re-enable foreign key checks
+            self.db.execute("SET FOREIGN_KEY_CHECKS = 1")
+            
+            self.logger.info(f"Successfully truncated {len(tables_to_truncate)} tables")
+            
+        except Exception as e:
+            self.logger.error(f"Error handling OVERWRITE mode: {str(e)}")
+            # Continue with import even if truncation fails 
+
+    def _split_sql_statements(self, content: str) -> List[str]:
+        """Split SQL content into individual statements, handling DELIMITER directives.
+        
+        Args:
+            content: SQL content to split
+            
+        Returns:
+            List of SQL statements
+        """
+        statements = []
+        current_statement = []
+        delimiter = ";"
+        in_string = False
+        string_char = None
+        in_comment = False
+        escaped = False
+        
+        lines = content.split('\n')
+        
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            i += 1
+            
+            # Check for DELIMITER directive
+            if line.upper().startswith('DELIMITER '):
+                # Complete current statement if any
+                if current_statement:
+                    stmt = '\n'.join(current_statement).strip()
+                    if stmt:
+                        statements.append(stmt)
+                    current_statement = []
+                
+                # Set new delimiter
+                delimiter = line[10:].strip()
+                continue
+            
+            # Skip empty lines and comments
+            if not line or line.startswith('--') or line.startswith('#'):
+                current_statement.append(line)
+                continue
+            
+            # Process line character by character
+            j = 0
+            while j < len(line):
+                char = line[j]
+                next_char = line[j+1] if j+1 < len(line) else None
+                
+                # Handle escape character
+                if char == '\\' and not escaped:
+                    escaped = True
+                    j += 1
+                    continue
+                
+                # Handle string literals
+                if not in_comment and (char == "'" or char == '"') and not escaped:
+                    if not in_string:
+                        in_string = True
+                        string_char = char
+                    elif string_char == char:
+                        in_string = False
+                
+                # Handle comments
+                if not in_string and not in_comment and char == '-' and next_char == '-':
+                    in_comment = True
+                    j += 2
+                    continue
+                elif not in_string and not in_comment and char == '#':
+                    in_comment = True
+                    j += 1
+                    continue
+                elif not in_string and not in_comment and char == '/' and next_char == '*':
+                    in_comment = True
+                    j += 2
+                    continue
+                elif in_comment and char == '*' and next_char == '/':
+                    in_comment = False
+                    j += 2
+                    continue
+                
+                # Handle end of line (reset line comment)
+                if j == len(line) - 1:
+                    in_comment = False
+                
+                # Check for delimiter
+                if not in_string and not in_comment and not escaped:
+                    # If we found the delimiter
+                    if line[j:j+len(delimiter)] == delimiter:
+                        # Add current line up to delimiter
+                        current_statement.append(line[:j+len(delimiter)])
+                        
+                        # Complete the statement
+                        stmt = '\n'.join(current_statement).strip()
+                        if stmt:
+                            # Remove the delimiter from the end
+                            if stmt.endswith(delimiter):
+                                stmt = stmt[:-len(delimiter)]
+                            statements.append(stmt)
+                        
+                        # Start a new statement with the rest of the line
+                        current_statement = [line[j+len(delimiter):]]
+                        break
+                
+                # Reset escape flag
+                escaped = False
+                j += 1
+            
+            # If we didn't find a delimiter, add the whole line
+            if j >= len(line):
+                current_statement.append(line)
+        
+        # Add the last statement if any
+        if current_statement:
+            stmt = '\n'.join(current_statement).strip()
+            if stmt and not stmt.upper().startswith('DELIMITER '):
+                statements.append(stmt)
+        
+        return statements 
